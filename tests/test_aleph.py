@@ -586,3 +586,61 @@ class TestGeometryEquivalence:
                 out, h = m(ids[:, i:i + 8], state=h)
                 parts.append(out)
         assert torch.allclose(whole, torch.cat(parts, dim=1), atol=1e-4)
+
+
+class TestCheckpointIdentity:
+    """A checkpoint is only readable against the architecture that wrote it.
+
+    The codebook is generated from the seed and the readout *is* that codebook,
+    so a field that decides the weights' meaning but is missing from
+    `ARCH_FIELDS` means `--mode eval` silently scores a different model than
+    the one that was trained.
+    """
+
+    def test_arch_fields_covers_every_constructor_argument(self):
+        import inspect
+        import tools.experiment as X
+        from aleph.core.core import AlephCore
+        # Every AlephCore knob that changes the parameter shapes or the
+        # codebook, as opposed to runtime behaviour.
+        runtime = {'self', 'codebook', 'device', 'dropout',
+                   'gradient_checkpointing', 'activation'}
+        knobs = set(inspect.signature(AlephCore.__init__).parameters) - runtime
+        missing = knobs - set(X.ARCH_FIELDS)
+        assert not missing, f"ARCH_FIELDS is missing {sorted(missing)}"
+
+    def test_arch_of_round_trips_through_restore(self):
+        import argparse
+        import tools.experiment as X
+        a = argparse.Namespace(
+            neurons=64, depth=4, rank=None, nnz=16, code='random', seed=0,
+            no_self_gain=False, no_attn=True, attn_heads=2, attn_kv_heads=1,
+            attn_head_dim=8, attn_window=16,
+            no_plastic=False, plastic_dim=8, no_aux=True, aux_rank=4,
+            quant='int8')
+        meta = {'vocab_size': V, 'path': 'x/y.bin'}
+        arch = X.arch_of(a, meta)
+        assert arch['attn'] is False and arch['aux'] is False
+        assert arch['plastic'] is True and arch['self_gain'] is True
+
+        fresh = argparse.Namespace(**{k: None for k in vars(a)})
+        X.restore_arch(fresh, {'arch': arch})
+        assert (fresh.no_attn, fresh.no_plastic, fresh.no_aux) == (True, False, True)
+        assert fresh.no_self_gain is False
+        for k in ('neurons', 'depth', 'nnz', 'code', 'seed', 'quant',
+                  'attn_heads', 'attn_kv_heads', 'attn_head_dim', 'attn_window',
+                  'plastic_dim', 'aux_rank'):
+            assert getattr(fresh, k) == getattr(a, k), k
+        # And the round trip is a fixed point, which is what resume compares.
+        assert X.arch_of(fresh, meta) == arch
+
+    def test_state_dict_reloads_strictly_for_every_branch_combination(self):
+        import itertools
+        for attn, plastic, aux in itertools.product((True, False), repeat=3):
+            m = make(depth=4, attn=attn, plastic=plastic, aux=aux)
+            twin = make(depth=4, attn=attn, plastic=plastic, aux=aux)
+            twin.load_state_dict(m.state_dict(), strict=True)
+            ids = torch.randint(0, V, (2, 8))
+            a_out, _ = m.eval()(ids)
+            b_out, _ = twin.eval()(ids)
+            assert torch.equal(a_out, b_out), (attn, plastic, aux)

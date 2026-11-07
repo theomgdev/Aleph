@@ -44,7 +44,13 @@ WARMUP = 200
 
 # Architecture identity: a checkpoint is only readable against the same values,
 # since the codebook is generated from them and the readout is that codebook.
-ARCH_FIELDS = ('neurons', 'depth', 'rank', 'vocab', 'nnz', 'code', 'seed', 'cache')
+# Everything that decides what the weights mean. The resume guard compares
+# these and `--mode eval` restores from them, so a field missing here is a
+# checkpoint that silently loads into the wrong architecture.
+ARCH_FIELDS = ('neurons', 'depth', 'rank', 'vocab', 'nnz', 'code', 'seed', 'cache',
+               'self_gain', 'attn', 'attn_heads', 'attn_kv_heads',
+               'attn_head_dim', 'attn_window', 'plastic', 'plastic_dim',
+               'aux', 'aux_rank', 'quant')
 
 
 def find_cache(data_dir, name=None):
@@ -76,7 +82,9 @@ def build(a, meta, verbose=True):
         cb.set_unigram(unigram_counts(meta, meta['vocab_size']))
     model = AlephCore(a.neurons, cb, depth=a.depth, rank=a.rank,
                       activation=a.activation, dropout=a.dropout,
+                      self_gain=not a.no_self_gain,
                       attn=not a.no_attn, attn_heads=a.attn_heads,
+                      attn_kv_heads=a.attn_kv_heads,
                       attn_head_dim=a.attn_head_dim, attn_window=a.attn_window,
                       plastic=not a.no_plastic, plastic_dim=a.plastic_dim,
                       aux=not a.no_aux, aux_rank=a.aux_rank, quant=a.quant,
@@ -104,7 +112,9 @@ def arch_of(a, meta):
     return {'neurons': a.neurons, 'depth': a.depth, 'rank': a.rank,
             'vocab': meta['vocab_size'], 'nnz': a.nnz, 'code': a.code,
             'seed': a.seed, 'cache': pathlib.Path(meta['path']).name,
+            'self_gain': not a.no_self_gain,
             'attn': not a.no_attn, 'attn_heads': a.attn_heads,
+            'attn_kv_heads': a.attn_kv_heads,
             'attn_head_dim': a.attn_head_dim, 'attn_window': a.attn_window,
             'plastic': not a.no_plastic, 'plastic_dim': a.plastic_dim,
             'aux': not a.no_aux, 'aux_rank': a.aux_rank, 'quant': a.quant}
@@ -328,17 +338,37 @@ def run_smoke(a, meta):
     print("\n  SMOKE PASS")
 
 
+def restore_arch(a, blob):
+    """Put a checkpoint's architecture back onto the args before building.
+
+    `arch_of` writes the booleans the way the model reads them (`attn: True`),
+    while the CLI carries the negations (`--no-attn`), so the two have to be
+    translated rather than copied. A field handled here but absent from an older
+    checkpoint keeps whatever the CLI default is, which is the only safe
+    fallback: it is visible in the `branches:` line that `build` prints.
+    """
+    arch = blob['arch']
+    for k, v in arch.items():
+        if k in ('vocab', 'cache'):
+            continue  # identity of the corpus, not a constructor argument
+        if k in ('attn', 'plastic', 'aux', 'self_gain'):
+            setattr(a, f'no_{k}', not v)
+        else:
+            setattr(a, k, v)
+    return a
+
+
 def run_eval(a, meta):
     ck = pathlib.Path(a.ckpt) / f"aleph_{a.tag}.pt"
     if not ck.exists():
         raise SystemExit(f"{ck} not found")
     blob = torch.load(ck, map_location=a.device, weights_only=True)
-    for k in ARCH_FIELDS:
-        setattr(a, k, blob['arch'][k]) if hasattr(a, k) else None
-    a.neurons, a.depth, a.rank = blob['arch']['neurons'], blob['arch']['depth'], blob['arch']['rank']
-    a.nnz, a.code, a.seed = blob['arch']['nnz'], blob['arch']['code'], blob['arch']['seed']
+    restore_arch(a, blob)
     model = build(a, meta)
-    model.load_state_dict(blob['model'])
+    # strict: the branches were just restored from the checkpoint's own arch, so
+    # a missing or unexpected key means that restoration is wrong and the score
+    # would be measured on a different model than the one that was trained.
+    model.load_state_dict(blob['model'], strict=True)
     _, va = streams(a, meta)
     trainer = Trainer(model, device=torch.device(a.device))
     ev = trainer.evaluate(va, 60)
@@ -349,10 +379,100 @@ def run_eval(a, meta):
     return ev
 
 
+def run_depends(a, meta):
+    """What has the trained model come to depend on?
+
+    An ablation measures what a mechanism adds when the rest of the model can
+    train around it. This measures what the finished weights cannot do without,
+    by intervening on a trained checkpoint and re-scoring. The two are different
+    quantities and the second is usually much larger.
+
+    For the stateful branches it also separates memory from capacity: shortening
+    how long a cache may persist says how far back the model is actually
+    reading, as opposed to how far it was allowed to.
+    """
+    ck = pathlib.Path(a.ckpt) / f"aleph_{a.tag}.pt"
+    if not ck.exists():
+        raise SystemExit(f"{ck} not found")
+    blob = torch.load(ck, map_location=a.device, weights_only=True)
+    restore_arch(a, blob)
+    model = build(a, meta, verbose=False)
+    model.load_state_dict(blob['model'], strict=True)
+    _, va = streams(a, meta)
+    trainer = Trainer(model, device=torch.device(a.device))
+
+    def score():
+        model.reset_caches()
+        ev = trainer.evaluate(va, 40)
+        return ev['loss'], ev['bits_per_byte']
+
+    base = score()
+    print(f"\n  step {blob['step']:,}  {base[0]:.4f} nats  {base[1]:.4f} bpb\n")
+    print(f"  {'intervention':<40} {'nats':>8} {'bpb':>8} {'delta':>9}")
+    print(f"  {'-' * 68}")
+
+    def row(label, res):
+        print(f"  {label:<40} {res[0]:>8.4f} {res[1]:>8.4f} {res[0] - base[0]:>+9.4f}")
+
+    row('(none)', base)
+
+    for name, branch in (('attention', model.attn), ('plasticity', model.plastic)):
+        if branch is None:
+            continue
+        saved = branch.forward
+        branch.forward = lambda *args, **kw: torch.zeros_like(args[0])
+        row(f'{name} branch zeroed', score())
+        branch.forward = saved
+
+    if model.attn is not None:
+        full = model.attn.window
+        for w in (1, 8, 32, 64):
+            if w >= full:
+                continue
+            model.attn.window = w
+            row(f'attention cache limited to {w}', score())
+        model.attn.window = full
+
+    if model.plastic is not None:
+        # The trace reads before it writes, so resetting it every token is
+        # exactly deleting the branch. Limiting the horizon is the real question.
+        saved = model.plastic.forward
+        for k in (2, 16, 64):
+            def chunked(h_seq, window=32, _k=k):
+                out = []
+                for i in range(0, h_seq.shape[1], _k):
+                    model.plastic.reset_cache()
+                    out.append(saved(h_seq[:, i:i + _k], window=0))
+                return torch.cat(out, dim=1)
+            model.plastic.forward = chunked
+            row(f'plasticity trace limited to {k}', score())
+        model.plastic.forward = saved
+
+    for label, tensor in (('aux encoder (conv)', getattr(model.enc, 'weight', None)),
+                          ('aux readout adapter', model.dec_v)):
+        if tensor is None:
+            continue
+        saved = tensor.detach().clone()
+        with torch.no_grad():
+            tensor.zero_()
+        row(f'{label} zeroed', score())
+        with torch.no_grad():
+            tensor.copy_(saved)
+
+    print(f"  {'-' * 68}")
+    print("\n  A branch whose removal costs nothing was not doing anything. A cache\n"
+          "  whose horizon stops mattering past k is reading k tokens back, not\n"
+          "  the window it was given.")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--mode', choices=('train', 'smoke', 'ablate', 'eval'), default='train')
+    p.add_argument('--mode', choices=('train', 'smoke', 'ablate', 'eval', 'depends'),
+                   default='train',
+                   help="depends: intervene on a trained checkpoint to see what "
+                        "the finished weights rely on, which is not what an "
+                        "ablation measures.")
 
     g = p.add_argument_group('architecture')
     g.add_argument('--neurons', type=int, default=NEURONS)
@@ -364,8 +484,12 @@ def parse_args():
     g.add_argument('--no-unigram', action='store_true',
                    help="Leave the logit bias at zero — the arm that measures "
                         "what the unigram prior was worth.")
+    g.add_argument('--no-self-gain', action='store_true',
+                   help="Drop the per-neuron self-connection latch.")
     g.add_argument('--no-attn', action='store_true', help="Drop temporal attention.")
     g.add_argument('--attn-heads', type=int, default=4)
+    g.add_argument('--attn-kv-heads', type=int, default=1,
+                   help="Shared KV heads. The cache, not the projections, is the cost.")
     g.add_argument('--attn-head-dim', type=int, default=16)
     g.add_argument('--attn-window', type=int, default=128)
     g.add_argument('--no-plastic', action='store_true', help="Drop delta-rule fast weights.")
@@ -423,8 +547,8 @@ def main():
     print(f"corpus {pathlib.Path(meta['path']).name}: "
           f"{meta['train_tokens']:,} train / {meta['val_tokens']:,} val tokens, "
           f"V={meta['vocab_size']}, {meta['bytes_per_token']:.2f} chars/token")
-    {'train': run_train, 'smoke': run_smoke,
-     'ablate': run_ablate, 'eval': run_eval}[a.mode](a, meta)
+    {'train': run_train, 'smoke': run_smoke, 'ablate': run_ablate,
+     'eval': run_eval, 'depends': run_depends}[a.mode](a, meta)
 
 
 if __name__ == '__main__':

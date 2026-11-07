@@ -341,3 +341,56 @@ by 0.531 nats at zero parameter cost — the largest single win in the table.
 The advantage is in convergence *rate*, not in the final optimum, so it is
 invisible early: at 25 steps AdamW is still ahead by 0.20 nats. A probe short
 enough to be cheap is long enough to reach the wrong conclusion here.
+
+## Are the branches memories, or just parameters?
+
+The ablation says plasticity is worth 0.119 nats and attention 0.064. It does
+not say why, and two explanations fit either number: the branch carries
+information across time, or its projections are simply more capacity. Those
+predict different things about a trained model, so intervening on the state of
+a finished checkpoint separates them. Measured on the step-2000 checkpoint
+(3.1844 nats, 1.1661 bpb, 40 val batches at `B=32, T=256`):
+
+| intervention | nats | bpb | Δ nats |
+|---|---|---|---|
+| none | 3.1844 | 1.1661 | — |
+| plasticity branch zeroed | 3.6412 | 1.3334 | +0.457 |
+| attention branch zeroed | 6.4918 | 2.3773 | +3.307 |
+| attention cache truncated to 1 | 3.2428 | 1.1875 | +0.058 |
+| attention cache truncated to 8 | 3.2191 | 1.1789 | +0.035 |
+| attention cache truncated to 32 | 3.1875 | 1.1673 | +0.003 |
+| attention cache truncated to 64 | 3.1794 | 1.1643 | −0.005 |
+| aux encoder zeroed | 5.3063 | 1.9432 | +2.122 |
+| aux readout adapter zeroed | 4.8359 | 1.7709 | +1.652 |
+
+Every branch is load-bearing by the end of training, and by far more than its
+ablation delta — removing attention from a trained model costs 3.3 nats where
+training without it cost 0.064. Those are different quantities: the ablation
+measures what a mechanism adds when the rest of the model can compensate, and
+this measures what the trained model has come to depend on. A branch that looks
+marginal in an ablation can still be load-bearing once the weights have
+organized around it, and that is not a contradiction.
+
+Varying how long plasticity's trace is allowed to persist answers the original
+question directly:
+
+| trace horizon | nats | bpb |
+|---|---|---|
+| 2 tokens | 3.5616 | 1.3043 |
+| 4 | 3.4772 | 1.2734 |
+| 16 | 3.2350 | 1.1847 |
+| 64 | 3.1119 | 1.1396 |
+| full 256 | 3.0670 | 1.1232 |
+
+Monotone in the horizon and still improving at 256, so the trace is a memory
+rather than extra capacity, and it is using every token it is given. Attention
+saturates at a cache of 32. The two branches are therefore reading different
+timescales — attention a short recent window, plasticity an unbounded running
+association — which is the mechanism behind their stacking near-additively.
+
+One row deserves its own note, because it looks like a bug and is not.
+Resetting the trace before every token scores *identically* to deleting the
+branch (3.6412 both). That is correct arithmetic: the delta rule reads before it
+writes, so a trace reset to zero is read as zero, and `o_proj` is bias-free, so
+the branch output is identically zero at every position. The horizon sweep above
+is the right form of the experiment.
