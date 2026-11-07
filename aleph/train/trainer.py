@@ -72,15 +72,22 @@ class Trainer:
             parameters and seed, orthogonalized updates on the 2D operators
             measured 4.7643 val nats against AdamW's 5.2949 at 400 steps --
             the same score AdamW needed 900 steps to reach.
+        reset_every (int): Start a fresh sequence every N steps, state and all
+            caches. Default 16. Carrying state indefinitely is what makes the
+            short-chunk geometry free, but it also means a cold start is ~0.02%
+            of training positions while being 100% of generation's first token
+            -- measured 11.54 nats at position 0 against 2.74 warm, and 38
+            tokens to recover. The model has to practise beginning.
     """
 
     def __init__(self, model, lr=1e-3, warmup=200, total=None, min_lr_frac=0.1,
                  weight_decay=0.01, clip=1.0, window=32, device=None,
-                 optimizer='muon'):
+                 optimizer='muon', reset_every=16):
         self.model = model
         self.device = device or next(model.parameters()).device
         self.lr, self.warmup, self.total = lr, warmup, total
         self.min_lr_frac, self.clip, self.window = min_lr_frac, clip, window
+        self.reset_every = reset_every
         self.step_count = 0
 
         if optimizer == 'muon':
@@ -186,6 +193,11 @@ class Trainer:
             x, y = train_stream.next()
             x = torch.as_tensor(x, device=self.device)
             y = torch.as_tensor(y, device=self.device)
+            # Periodically begin again, so the first few positions of a
+            # sequence get gradient at all. `state=None` resets the branch
+            # caches too.
+            if self.reset_every and step % self.reset_every == 0:
+                state = None
             m, state = self.train_step(x, y, state)
             window.append(m)
             tokens += x.numel()

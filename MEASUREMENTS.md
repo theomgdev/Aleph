@@ -494,3 +494,149 @@ bits-per-byte figure as a measure of *computation* should know that about half
 the readout's variance at this checkpoint is a corpus statistic rather than
 something the core computed. The `--no-unigram` arm exists to measure that, and
 quoting it beside the headline number is the honest form.
+
+## The cold-start cliff
+
+After the decode fix and the temperature fix, the step-6000 samples had a
+distinctive shape: the first ~8 tokens after each prompt were garbled, and
+then the model recovered into clean prose (*"The girl was so sad and she
+realized that she was alone, but she never forgot her special gift"*). The
+prompts are 3–4 tokens.
+
+Per-position loss on validation text after a cold start (`state=None`), averaged
+over 768 sequences:
+
+| position band | nats | bpb |
+|---|---|---|
+| 0 | 11.5401 | 4.2260 |
+| 1 | 10.4133 | 3.8134 |
+| 2–3 | 7.6042 | 2.7847 |
+| 4–7 | 5.2395 | 1.9187 |
+| 8–15 | 3.9707 | 1.4541 |
+| 16–31 | 3.2281 | 1.1821 |
+| 32–63 | 2.8757 | 1.0531 |
+| 64–127 | 2.7400 | 1.0034 |
+
+Position 0 is **worse than uniform** (8.32 nats at `V=4096`), and the model does
+not come within 0.05 nats of its warm score until position 38. A 4-token prompt
+leaves generation at position 4, where the loss is still 5.24 nats — so the
+first generated tokens are drawn from a barely warmed-up state, and the prose
+only becomes good once the model's own outputs have warmed it up.
+
+The mechanism is a training-vs-use mismatch created by our own speedup.
+Carrying state across calls is what made the short-chunk geometry free, and it
+also meant step 0 of 6,000 was the only cold start the model ever saw — ~0.02%
+of training positions, against 100% of generation's first token. The model was
+never trained to begin.
+
+Two fixes were tested at 1,200 steps (`B=256, T=64`), alone and together:
+`reset_every=16` (start a fresh sequence every 16 steps, state and all branch
+caches) and a learned initial state `h0` (`N` parameters). Mean nats by position
+band after a cold start, plus the position where the loss comes within 0.05 of
+warm:
+
+| arm | pos 0 | pos 1 | 2–3 | 4–7 | 8–15 | 16–31 | 32–63 | 64–127 | recovery |
+|---|---|---|---|---|---|---|---|---|---|
+| zeros `h0`, no reset | 7.44 | 7.47 | 7.35 | 5.52 | 4.39 | 4.01 | 3.76 | 3.72 | 37 |
+| zeros `h0`, reset 16 | 5.03 | 5.30 | 4.44 | 4.17 | 3.88 | 3.80 | 3.69 | 3.69 | **10** |
+| learned `h0`, no reset | 8.79 | 7.94 | 6.99 | 5.38 | 4.28 | 3.93 | 3.74 | 3.71 | 22 |
+| learned `h0`, reset 16 | 5.67 | 4.80 | 4.36 | 4.17 | 3.87 | 3.81 | 3.70 | 3.70 | **10** |
+
+`reset_every=16` is the whole win. It cuts the recovery horizon from 37 tokens
+to 10, drops position 2–3 from 7.35 to 4.44, and slightly *improves* the warm
+score too (3.72 → 3.69), because 16 steps of 64 tokens is 1,024 tokens — longer
+than any dependency the model was using.
+
+`learned h0` did not beat `zeros h0` once resets were on (5.67 vs 5.03 at
+position 0, identical recovery of 10, 0.01 worse warm), so it was removed. The
+problem was never that zero is a bad starting point; it was that the starting
+point never got gradient. Zero parameters beat 512.
+
+One hazard surfaced while testing `h0` and is worth recording even though the
+parameter was dropped: passing a zero-initialized vector through `RMSNorm` gave
+`|g| = 6,649` on `h0` at step 0, because the norm divides by the input's own
+RMS and its Jacobian diverges at the origin. And placing an RNG-drawn parameter
+after an `if depth > 0:` block shifts the generator state by `depth`, which
+broke `test_depth_is_inert_at_init` on its first run.
+
+## The full synthesis run
+
+6,000 steps at the default geometry and schedule (`N=512, depth=8, B=256, T=64,
+window=32, reset_every=16, lr=1e-3, warmup=200`, Muon on operators, all three
+branches on in the compact configuration), against the same cache as the
+baseline (`tinystories400k_bpe4096_b0b0cc61.bin`, 92,012,977 train / 929,424
+val tokens, 3.94 chars/token):
+
+| run | trainable params | tokens | tok/s | best val nats | best val bpb | final val bpb | ppl |
+|---|---|---|---|---|---|---|---|
+| baseline (`core + refine`, AdamW, `B=96, T=256`) | 793,089 | 147.5M (1.60 ep) | 38,921 | 3.2498 | 1.1901 | 1.1901 | 25.79 |
+| synthesis (all four, `B=256, T=64, reset=16`) | 1,027,169 | 98.3M (1.07 ep) | 58,709 | **2.7126** | **0.9934** | **0.9994** | **15.07** |
+
+−0.537 nats (−0.197 bpb, perplexity 25.79 → 15.07) in two-thirds the token
+budget and at 1.5× the throughput, for +234k parameters. The synthesis crosses
+the baseline's final 6,000-step score before step 2,000.
+
+### Trajectory
+
+| step | train nats | val nats | val bpb | val ppl | `|g|` | `|h|` | epochs |
+|---|---|---|---|---|---|---|---|
+| 500 | 4.2929 | 4.3320 | 1.5864 | 76.10 | 11.15 | 21.51 | 0.09 |
+| 1,000 | 3.5416 | 3.6305 | 1.3295 | 37.73 | 6.53 | 21.20 | 0.18 |
+| 1,500 | 3.2286 | 3.3860 | 1.2400 | 29.55 | 4.62 | 20.98 | 0.27 |
+| 2,000 | 3.0598 | 3.1806 | 1.1648 | 24.06 | 3.62 | 20.77 | 0.36 |
+| 3,000 | 2.8977 | 2.9317 | 1.0736 | 18.76 | 3.04 | 20.57 | 0.54 |
+| 4,000 | 2.8055 | 2.8012 | 1.0258 | 16.46 | 2.81 | 20.49 | 0.71 |
+| 5,000 | 2.7112 | 2.7540 | 1.0085 | 15.71 | 2.70 | 20.46 | 0.89 |
+| 6,000 | 2.7010 | 2.7126 | 0.9934 | 15.07 | 2.67 | 20.46 | 1.07 |
+
+### Samples
+
+Unprompted continuations at `T=0.6`, top-k 40, after all three fixes (carried
+conv tail, temperature, `reset_every=16`):
+
+> `Once upon a time` → *", there was a little boy named Timmy. Timmy loved to
+> play outside and explore the world around him. One day, Timmy saw a big,
+> scary monster called Billy. Billy was scared and wanted to catch it.
+> \n\n\"Hi, Timmy! I'm scared of the monster,\" said Billy."*
+
+> `The little girl` → *" was very sad and her mom was happy to help.\n\nThe
+> girl thanked her mom for helping her and went home."*
+
+> `Tom and Sara` → *" looked at the ground. It liked to play with it. Sara
+> liked to play with the ball."*
+
+Every prompt begins cleanly from its first token — no warmuptransient, dialogue
+with matching quotation marks and speaker attribution, and character names that
+persist across paragraphs.
+
+### What the step-6000 checkpoint depends on
+
+`python tools/experiment.py --mode depends --tag main` (40 val batches at
+`B=32, T=256`):
+
+| intervention | nats | bpb | Δ nats |
+|---|---|---|---|
+| none | 2.7905 | 1.0219 | — |
+| attention branch zeroed | 10.1966 | 3.7341 | +7.406 |
+| plasticity branch zeroed | 3.2568 | 1.1927 | +0.466 |
+| aux encoder zeroed | 5.8860 | 2.1555 | +3.096 |
+| aux readout adapter zeroed | 5.2516 | 1.9232 | +2.461 |
+| unigram logit bias zeroed | 4.4007 | 1.6116 | +1.610 |
+| attention cache limited to 1 | 2.9190 | 1.0689 | +0.129 |
+| attention cache limited to 8 | 2.8563 | 1.0460 | +0.066 |
+| attention cache limited to 32 | 2.7674 | 1.0134 | −0.023 |
+| attention cache limited to 64 | 2.7419 | 1.0041 | −0.049 |
+| plasticity trace limited to 2 | 3.3645 | 1.2321 | +0.574 |
+| plasticity trace limited to 16 | 3.0038 | 1.1000 | +0.213 |
+| plasticity trace limited to 64 | 2.8209 | 1.0330 | +0.030 |
+
+Readout decomposition at step 6,000: state-dependent std 2.8344, fixed bias std
+2.6528, `signal/bias = 1.068`.
+
+One number in that table points at the next change rather than confirming the
+last one: truncating the attention cache from 128 to 64 *lowers* the loss by
+0.049 nats, and did the same at steps 2,000 (−0.005) and 3,500 (−0.040). The
+effect grows with training. So keys older than ~64 tokens are net noise for the
+attention branch while plasticity continues to improve out to 256 — further
+evidence that the two branches have divided the timescales between them, and
+that `attn_window` is wider than the job attention has taken on.

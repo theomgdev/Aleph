@@ -732,3 +732,34 @@ class TestDecodeConsistency:
         m = make(depth=0, attn=False, plastic=False)
         assert m.enc.padding == (0,)
         assert m.enc.kernel_size == (m.aux_kernel,)
+
+
+class TestColdStart:
+    """A sequence has to begin, and beginning was what was not trained.
+
+    When state is carried across every step, a cold start is ~0.02% of training
+    positions while being 100% of generation's first token. `reset_every` makes
+    the start appear on a schedule, and when it triggers it must clear the
+    branch caches along with the hidden state -- a reset that clears `h` while
+    leaving the attention cache warm is not a cold start.
+    """
+
+    def test_reset_every_clears_state_and_branch_caches_on_schedule(self, cache):
+        m = make(depth=4)
+        t = Trainer(m, lr=1e-2, warmup=1, total=10, reset_every=2)
+        s = TokenStream(cache, 4, 8)
+        v = TokenStream(cache, 2, 8, 'val')
+        # 2 steps: step 0 starts cold (pos -> 8), step 1 carries (pos -> 16).
+        t.run(s, v, 2, log_every=10, eval_every=0)
+        assert m.attn._pos == 16
+        # 1 step covers only step 0, which `step % 2 == 0` resets (pos -> 8).
+        t.run(s, v, 1, log_every=10, eval_every=0)
+        assert m.attn._pos == 8
+
+    def test_reset_every_zero_carries_indefinitely(self, cache):
+        m = make(depth=4)
+        t = Trainer(m, lr=1e-2, warmup=1, total=10, reset_every=0)
+        s = TokenStream(cache, 4, 8)
+        v = TokenStream(cache, 2, 8, 'val')
+        t.run(s, v, 4, log_every=10, eval_every=0)
+        assert m.attn._pos == 32
