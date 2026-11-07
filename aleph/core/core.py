@@ -157,6 +157,8 @@ class AlephCore(nn.Module):
             rotates the state into the frozen codebook's frame so `h` does not
             have to serve as both recurrent memory and readout vector.
         aux_rank (int): Rank of the readout adapter. Default 64.
+        aux_kernel (int): Width of the causal conv over injected codes, so the
+            n in n-gram. Default 4.
         quant (str, optional): `'int8'`, `'int4'` or `'ternary'` QAT on the
             recurrent operators. Default None. int8 measured free; see
             `quantize_ste`.
@@ -169,7 +171,7 @@ class AlephCore(nn.Module):
     def __init__(self, neurons, codebook, depth=4, rank=None, activation='gelu',
                  self_gain=True, attn=True, attn_heads=4, attn_kv_heads=1,
                  attn_head_dim=16, attn_window=128, plastic=True, plastic_dim=32,
-                 aux=True, aux_rank=64, quant=None, dropout=0.0,
+                 aux=True, aux_rank=64, aux_kernel=4, quant=None, dropout=0.0,
                  gradient_checkpointing=False, device=None):
         super().__init__()
         if neurons < 2:
@@ -231,6 +233,7 @@ class AlephCore(nn.Module):
 
         self.drop = nn.Dropout(dropout)
         self.quant = quant
+        self._enc_tail = None
         self.register_buffer('_h', torch.zeros(1, neurons, device=device), persistent=False)
 
         # The three optional branches, all zero-initialized at their output so
@@ -245,9 +248,10 @@ class AlephCore(nn.Module):
         if aux:
             # Causal depthwise conv over injected codes: local n-gram context
             # before the recurrence sees the token. Zero-init, so inert at step 0.
-            self.enc = nn.Conv1d(neurons, neurons, kernel_size=4, padding=3,
+            self.enc = nn.Conv1d(neurons, neurons, kernel_size=aux_kernel,
                                  groups=neurons, bias=False, device=device)
             nn.init.zeros_(self.enc.weight)
+            self.aux_kernel = aux_kernel
             # The readout adapter. Without it `h` must be the recurrent state
             # and point along a frozen random code at the same time; a rank-r
             # rotation separates those two jobs for 2*N*r parameters.
@@ -263,11 +267,31 @@ class AlephCore(nn.Module):
     # ------------------------------------------------------------------ #
 
     def reset_caches(self):
-        """Drop the attention KV cache and the fast-weight trace."""
+        """Drop every cache that carries sequence history across calls."""
         if self.attn is not None:
             self.attn.reset_cache()
         if self.plastic is not None:
             self.plastic.reset_cache()
+        self._enc_tail = None
+
+    def _encode(self, codes):
+        """Add local n-gram context to the injected codes, causally.
+
+        The conv's left context has to come from the previous call, not from
+        zeros, or a token decoded one at a time sees `kernel-1` zeros where
+        training gave it real predecessors. Carrying the tail is what makes
+        chunked and whole-sequence runs agree -- and generation samples one
+        token at a time, so without it the model generates from a distribution
+        it was never scored on.
+        """
+        pad = self.aux_kernel - 1
+        if self._enc_tail is None or self._enc_tail.shape[0] != codes.shape[0]:
+            left = codes.new_zeros(codes.shape[0], pad, codes.shape[2])
+        else:
+            left = self._enc_tail
+        padded = torch.cat([left, codes], dim=1)
+        self._enc_tail = padded[:, -pad:].detach() if pad else None
+        return codes + self.enc(padded.transpose(1, 2)).transpose(1, 2)
 
     def _step(self, h, code, W=None, U=None, V=None, self_mult=None):
         """One token: mix, inject, refine, normalize.
@@ -330,7 +354,7 @@ class AlephCore(nn.Module):
         # matmul and nothing else.
         codes = self.codebook.inject(ids)
         if self.enc is not None:
-            codes = codes + self.enc(codes.transpose(1, 2))[..., :t].transpose(1, 2)
+            codes = self._encode(codes)
 
         # Hoisted out of the loop: these are constant across the `t` steps, and
         # recomputing them per step measured a 31% throughput loss on a

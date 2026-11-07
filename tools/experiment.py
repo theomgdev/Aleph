@@ -50,7 +50,7 @@ WARMUP = 200
 ARCH_FIELDS = ('neurons', 'depth', 'rank', 'vocab', 'nnz', 'code', 'seed', 'cache',
                'self_gain', 'attn', 'attn_heads', 'attn_kv_heads',
                'attn_head_dim', 'attn_window', 'plastic', 'plastic_dim',
-               'aux', 'aux_rank', 'quant')
+               'aux', 'aux_rank', 'aux_kernel', 'quant')
 
 
 def find_cache(data_dir, name=None):
@@ -87,7 +87,8 @@ def build(a, meta, verbose=True):
                       attn_kv_heads=a.attn_kv_heads,
                       attn_head_dim=a.attn_head_dim, attn_window=a.attn_window,
                       plastic=not a.no_plastic, plastic_dim=a.plastic_dim,
-                      aux=not a.no_aux, aux_rank=a.aux_rank, quant=a.quant,
+                      aux=not a.no_aux, aux_rank=a.aux_rank,
+                      aux_kernel=a.aux_kernel, quant=a.quant,
                       gradient_checkpointing=a.checkpoint, device=dev).to(dev)
 
     if verbose:
@@ -117,7 +118,8 @@ def arch_of(a, meta):
             'attn_kv_heads': a.attn_kv_heads,
             'attn_head_dim': a.attn_head_dim, 'attn_window': a.attn_window,
             'plastic': not a.no_plastic, 'plastic_dim': a.plastic_dim,
-            'aux': not a.no_aux, 'aux_rank': a.aux_rank, 'quant': a.quant}
+            'aux': not a.no_aux, 'aux_rank': a.aux_rank,
+            'aux_kernel': a.aux_kernel, 'quant': a.quant}
 
 
 def streams(a, meta):
@@ -496,6 +498,8 @@ def parse_args():
     g.add_argument('--plastic-dim', type=int, default=32)
     g.add_argument('--no-aux', action='store_true', help="Drop the encoder and readout adapter.")
     g.add_argument('--aux-rank', type=int, default=64)
+    g.add_argument('--aux-kernel', type=int, default=4,
+                   help="Width of the causal conv over injected codes: the n in n-gram.")
     g.add_argument('--quant', choices=('int8', 'int4', 'ternary'), default=None,
                    help="QAT on the recurrent operators. int8 measured free; "
                         "int4 costs +0.27 nats, ternary +0.48.")

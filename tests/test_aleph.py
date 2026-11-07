@@ -617,7 +617,7 @@ class TestCheckpointIdentity:
             no_self_gain=False, no_attn=True, attn_heads=2, attn_kv_heads=1,
             attn_head_dim=8, attn_window=16,
             no_plastic=False, plastic_dim=8, no_aux=True, aux_rank=4,
-            quant='int8')
+            aux_kernel=3, quant='int8')
         meta = {'vocab_size': V, 'path': 'x/y.bin'}
         arch = X.arch_of(a, meta)
         assert arch['attn'] is False and arch['aux'] is False
@@ -629,7 +629,7 @@ class TestCheckpointIdentity:
         assert fresh.no_self_gain is False
         for k in ('neurons', 'depth', 'nnz', 'code', 'seed', 'quant',
                   'attn_heads', 'attn_kv_heads', 'attn_head_dim', 'attn_window',
-                  'plastic_dim', 'aux_rank'):
+                  'plastic_dim', 'aux_rank', 'aux_kernel'):
             assert getattr(fresh, k) == getattr(a, k), k
         # And the round trip is a fixed point, which is what resume compares.
         assert X.arch_of(fresh, meta) == arch
@@ -644,3 +644,91 @@ class TestCheckpointIdentity:
             a_out, _ = m.eval()(ids)
             b_out, _ = twin.eval()(ids)
             assert torch.equal(a_out, b_out), (attn, plastic, aux)
+
+
+def trained_like(depth=4, **kw):
+    """A model whose optional branches are non-zero, as training leaves them.
+
+    Every branch is zero-initialized at its output, so a freshly built model
+    cannot detect a bug in any of them: the branch contributes nothing and a
+    broken one contributes nothing just as convincingly.
+    """
+    m = make(depth=depth, **kw)
+    with torch.no_grad():
+        if m.enc is not None:
+            torch.nn.init.normal_(m.enc.weight, std=0.5)
+            torch.nn.init.normal_(m.dec_v, std=0.1)
+        if m.attn is not None:
+            torch.nn.init.normal_(m.attn.o_proj.weight, std=0.1)
+        if m.plastic is not None:
+            torch.nn.init.normal_(m.plastic.o_proj.weight, std=0.1)
+    return m.eval()
+
+
+class TestDecodeConsistency:
+    """Chunk size must not change the answer.
+
+    This is the property the whole design rests on: the state and every cache
+    cross forward calls, so a sequence may be split anywhere. Generation splits
+    it into single tokens, which is the harshest case — if a cache does not
+    carry, the model samples from a distribution it was never scored on, and
+    the bits-per-byte figure describes a different model than the one producing
+    the text.
+    """
+
+    @pytest.mark.parametrize('chunk', [1, 2, 8])
+    def test_chunked_equals_whole(self, chunk):
+        m = trained_like()
+        ids = torch.randint(0, V, (3, 24))
+        with torch.no_grad():
+            whole, _ = m(ids, window=0)
+            m.reset_caches()
+            parts, h = [], None
+            for i in range(0, 24, chunk):
+                out, h = m(ids[:, i:i + chunk], state=h, window=0)
+                parts.append(out)
+        got = torch.cat(parts, dim=1)
+        assert torch.allclose(whole, got, atol=1e-4), \
+            f"chunk={chunk} diverges by {(whole - got).abs().max():.3e}"
+
+    @pytest.mark.parametrize('branch', ['aux', 'attn', 'plastic'])
+    def test_each_branch_carries_on_its_own(self, branch):
+        """Isolated, so a failure names the branch that does not carry."""
+        off = {'attn': False, 'plastic': False, 'aux': False}
+        m = trained_like(**{**off, branch: True})
+        ids = torch.randint(0, V, (2, 16))
+        with torch.no_grad():
+            whole, _ = m(ids, window=0)
+            m.reset_caches()
+            parts, h = [], None
+            for i in range(16):
+                out, h = m(ids[:, i:i + 1], state=h, window=0)
+                parts.append(out)
+        got = torch.cat(parts, dim=1)
+        assert torch.allclose(whole, got, atol=1e-4), \
+            f"{branch} does not carry across calls: {(whole - got).abs().max():.3e}"
+
+    def test_generation_is_causal(self):
+        """Editing token k must move nothing before k.
+
+        A conv with symmetric padding, or a cache that keeps future keys,
+        passes every consistency check above and still leaks the answer.
+        """
+        m = trained_like()
+        ids = torch.randint(0, V, (1, 16))
+        with torch.no_grad():
+            base, _ = m(ids, window=0)
+        for k in (4, 8, 12):
+            alt = ids.clone()
+            alt[0, k] = (alt[0, k] + 7) % V
+            with torch.no_grad():
+                out, _ = m(alt, window=0)
+            assert torch.equal(base[:, :k], out[:, :k]), f"position {k} leaks backward"
+            assert not torch.allclose(base[:, k:], out[:, k:]), f"position {k} has no effect"
+
+    def test_aux_conv_has_no_padding(self):
+        """The left context comes from the carried tail, so Conv1d must not
+        add its own — padding and a carry together would double-count."""
+        m = make(depth=0, attn=False, plastic=False)
+        assert m.enc.padding == (0,)
+        assert m.enc.kernel_size == (m.aux_kernel,)

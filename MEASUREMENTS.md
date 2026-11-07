@@ -394,3 +394,62 @@ branch (3.6412 both). That is correct arithmetic: the delta rule reads before it
 writes, so a trace reset to zero is read as zero, and `o_proj` is bias-free, so
 the branch output is identically zero at every position. The horizon sweep above
 is the right form of the experiment.
+
+## The decode bug, and why the score did not show it
+
+The first synthesis run reached 1.0016 bpb — a large improvement on the 1.1901
+baseline — and generated markedly *worse* text than the baseline had. Those two
+facts cannot both describe the same model, and the contradiction is the only
+reason the bug was found: every aggregate number was better, every test passed,
+and the samples were the sole dissenting evidence.
+
+The cause was the auxiliary encoder. `nn.Conv1d(kernel_size=4, padding=3)` with
+the output sliced to `[..., :t]` is correctly causal within one call, but it
+holds no state across calls, so its left context is zeros at the start of every
+call. Training called it once per 64-token chunk, where 3 of 64 positions are
+affected. Generation calls it once per token, where *every* position is
+affected: each token was convolved against three zeros instead of its three
+real predecessors. The model was scored with 4-gram context and sampled without
+it.
+
+Measured on real validation text at `T=24`, comparing a whole-sequence forward
+against the same tokens decoded one at a time:
+
+| configuration | max abs logit diff | argmax agreement |
+|---|---|---|
+| all branches | 1.2952 | 89.6% |
+| without the aux encoder | 0.0006 | 100.0% |
+| without attention | 0.4467 | 91.7% |
+| without plasticity | 1.2391 | 95.8% |
+| core only | 0.0010 | 100.0% |
+
+Isolating by removal is what identifies the culprit: dropping the encoder is
+the only intervention that restores agreement, so the other branches' caches
+were carrying correctly. Ten percent of generated tokens were drawn from the
+wrong distribution.
+
+The fix carries the last `kernel-1` code vectors across calls as a detached
+tail, exactly as the hidden state and the other caches do, and removes the
+conv's own padding so the two cannot double-count. After it, the same
+comparison gives 2.65e-06 with 100% argmax agreement, and an 8-token chunking
+gives 1.19e-06.
+
+Causality was then checked separately, because a consistency fix is exactly the
+kind of change that can buy agreement by letting the conv see the future.
+Editing the token at position `k` moves nothing at any position before `k`
+(difference exactly 0.0 at `k = 4, 8, 12`) and everything from `k` onward.
+
+Three things are worth keeping from this.
+
+A zero-initialized branch cannot be tested by a freshly built model: the branch
+contributes nothing, and a broken branch contributes nothing just as
+convincingly. The consistency tests now run against a model whose branch
+outputs have been randomized to non-zero, which is what training produces.
+
+Chunk-invariance is not a nicety here, it is the correctness condition. Any
+module that sees a window of the sequence must carry that window across calls,
+or the chunk size silently becomes a hyperparameter of the model's output —
+and generation is the limiting chunk size of 1, so a bug of this shape always
+lands on the samples and never on the loss.
+
+And the samples earned their place in the report. No aggregate caught this.

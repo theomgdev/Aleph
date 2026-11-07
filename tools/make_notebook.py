@@ -380,7 +380,34 @@ r = subprocess.run([sys.executable, "-u", "tools/experiment.py", "--mode", "abla
 print(r.stdout[-3000:])
 """),
 
-    md("""## 6 — Samples, and the honest accounting
+    md("""## 6 — What the trained model depends on
+
+An ablation measures what a mechanism adds while the rest of the model can
+train around it. It does not say what the finished weights rely on, and the two
+differ by a lot. Training without attention cost 0.064 nats; removing it from a
+trained checkpoint costs 6.7. Both are real and they answer different
+questions — the first is "was this worth adding", the second is "has the model
+organized around it" — so a branch that looks marginal in an ablation can still
+be load-bearing, with no contradiction.
+
+`--mode depends` asks the second question by intervening on a checkpoint and
+re-scoring. For the stateful branches it also separates memory from capacity:
+shortening how long a cache may persist says how far back the model is actually
+reading, as opposed to how far it was allowed to.
+
+Measured at step 3,500 (1.0800 bpb), limiting plasticity's trace gives 1.2635
+bpb at 2 tokens, 1.1421 at 16, 1.0819 at 64, 1.0800 at the full 256 — monotone
+and still improving at the end of the sequence, so the trace is a memory and it
+uses every token it is given. Attention saturates at a cache of 32. The two are
+reading different timescales, which is why they stack."""),
+    code("""
+r = subprocess.run([sys.executable, "-u", "tools/experiment.py", "--mode", "depends",
+                    "--ckpt", CKPT_DIR, "--tag", "main"],
+                   capture_output=True, text=True)
+print(r.stdout[-3000:] or r.stderr[-2000:])
+"""),
+
+    md("""## 7 — Samples, and the honest accounting
 
 Generation is the only check that reads as language rather than as a number.
 A model can score well and produce nothing: read the samples."""),
