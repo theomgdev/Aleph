@@ -187,3 +187,59 @@ TinyStories, 400,000 stories, in-domain BPE:
 
 Every bits-per-byte figure above is defined against this cache. A rebuilt cache
 moves the held-out boundary, so a comparison across caches is not a comparison.
+
+## The first full run
+
+`tools/experiment.py --mode train --neurons 512 --depth 8 --batch 96 --seq 256
+--window 32 --steps 6000 --lr 1e-3 --warmup 300`, on the 92M-token TinyStories
+cache (3.94 chars/token).
+
+| | |
+|---|---|
+| trainable | **793,089** — core 261,632 + refine 524,288 + interface 4,609 + mod 2,560 |
+| final val loss | 3.2498 nats |
+| final val bpb | **1.1901** |
+| perplexity | 25.79 |
+| data | 147.5M tokens, 1.60 epochs |
+| throughput | 38,921 tok/s |
+
+Against the unigram floor of 2.2376 bpb, the core earned **1.047 bpb**. Train
+and val tracked within 0.02 the whole way (1.177 train against 1.1984 val at
+step 6000), so nothing here is overfitting — at 1.6 epochs the model is still
+data-limited rather than capacity-limited, and the val curve was still falling
+when the schedule ended.
+
+Progression: 2.163 bpb (step 250) → 1.4900 (1500) → 1.3027 (3000) → 1.2528
+(3750, one epoch) → 1.2265 (4500) → **1.1901** (6000).
+
+`|h|` drifted 22.30 → 16.97 as the output RMSNorm gain learned to shrink the
+state; `|g|` fell 4.23 → 2.05, and `clip%` held at 100 throughout, which the
+clip sweep above establishes is the intended regime rather than a fault.
+
+### Samples
+
+Unprompted continuations at temperature 0.8, top-k 40:
+
+> `Once upon a time` → *" with a big, soft truck. They had a lot of fun with
+> their toys. [...] Tim and Sam are friends. They like to play with their toys,
+> but they do not like to play with Anna."*
+
+> `The little girl` → *"'s friend, a big, red bird. The cat was very proud of
+> her. [...] Sara and Tom are friends. They like to play with toys."*
+
+Grammatical sentences, consistent characters across clauses, and correct story
+structure including paragraph breaks. Semantic coherence over a whole story is
+not there — "a big, soft truck", and the third sample drifts — which is what
+1.6 epochs at this size buys.
+
+### What this is and is not evidence for
+
+It is evidence that a frozen `V + N + 1` token interface can carry a language
+model: the readout was never trained, and the model produces English through it.
+
+It is not yet a parameter-efficiency record, and the comparison that would
+decide that has not been run. The nearest published reference is
+TinyStories-1M (Eldan & Li 2023, arXiv:2305.07759) at 0.40M non-embedding
+parameters against Aleph's 0.79M core+refine, scored by GPT-4 rubric rather
+than bits per byte — so the two numbers are not comparable as they stand, and
+saying otherwise would be the exact error `README.md` warns about.

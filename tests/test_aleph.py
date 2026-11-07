@@ -270,6 +270,83 @@ class TestStream:
             build_cache(["x"], tok, tmp_path, 'big', verbose=False)
 
 
+class TestMuon:
+    def test_orthogonalize_tames_the_spectrum(self):
+        """Not an isometry -- it pulls the singular values toward 1, and how
+        far depends on conditioning. The claim is the ratio, not the value."""
+        from aleph.train.muon import orthogonalize
+        torch.manual_seed(0)
+        M = torch.randn(64, 64)
+        before = torch.linalg.svdvals(M)
+        after = torch.linalg.svdvals(orthogonalize(M).float())
+        assert after.max() / after.min() < before.max() / before.min()
+        assert after.max() < 1.5
+
+    def test_orthogonalize_handles_both_orientations(self):
+        from aleph.train.muon import orthogonalize
+        for shape in ((128, 32), (32, 128)):
+            out = orthogonalize(torch.randn(*shape))
+            assert out.shape == shape
+            assert torch.isfinite(out).all()
+
+    def test_orthogonalize_refuses_non_2d(self):
+        from aleph.train.muon import orthogonalize
+        with pytest.raises(ValueError, match="2D matrix"):
+            orthogonalize(torch.zeros(8))
+
+    def test_refuses_1d_in_the_muon_half(self):
+        """1D parameters have trivial singular values; the split is not
+        cosmetic, so a wrong one must fail loudly."""
+        from aleph.train.muon import MuonAdamW
+        with pytest.raises(ValueError, match=r"only to 2D operator matrices"):
+            MuonAdamW([torch.zeros(8)], [])
+
+    def test_from_model_splits_operators_from_modulation(self):
+        from aleph.train.muon import MuonAdamW
+        m = make(depth=4)
+        opt = MuonAdamW.from_model(m)
+        muon = {id(p) for g in opt.param_groups if g['use_muon'] for p in g['params']}
+        assert {id(m.W), id(m.U), id(m.V)} == muon
+        for p in (m.b, m.norm.weight, m.codebook.bias, m.codebook.in_gain):
+            assert id(p) not in muon
+
+    def test_step_preserves_the_zero_diagonal(self):
+        """Newton-Schulz returns a dense matrix, so W's diagonal must be
+        re-zeroed after the update or the core's invariant is lost."""
+        from aleph.train.muon import MuonAdamW
+        import torch.nn.functional as F
+        m = make(depth=4)
+        opt = MuonAdamW.from_model(m, lr=0.1)
+        logits, _ = m(torch.randint(0, V, (2, 8)))
+        F.cross_entropy(logits.reshape(-1, V).float(),
+                        torch.randint(0, V, (16,))).backward()
+        opt.step()
+        assert m.W.diagonal().abs().max() == 0
+
+    def test_step_moves_both_halves(self):
+        from aleph.train.muon import MuonAdamW
+        import torch.nn.functional as F
+        m = make(depth=4)
+        with torch.no_grad():
+            m.V.normal_(std=0.05)      # open the branch so U takes gradient
+        opt = MuonAdamW.from_model(m, lr=1e-2)
+        before = {n: p.detach().clone() for n, p in m.named_parameters()}
+        logits, _ = m(torch.randint(0, V, (2, 8)))
+        F.cross_entropy(logits.reshape(-1, V).float(),
+                        torch.randint(0, V, (16,))).backward()
+        opt.step()
+        for name in ('W', 'U', 'b', 'norm.weight'):
+            p = dict(m.named_parameters())[name]
+            assert (p - before[name]).abs().max() > 0, f"{name} did not move"
+
+    def test_set_lr_scales_the_muon_half(self):
+        from aleph.train.muon import MuonAdamW
+        opt = MuonAdamW.from_model(make(depth=4), lr=1e-3)
+        opt.set_lr(1e-3, muon_scale=3.0)
+        for g in opt.param_groups:
+            assert g['lr'] == pytest.approx(3e-3 if g['use_muon'] else 1e-3)
+
+
 class TestTrainer:
     def test_warmup_then_decay(self):
         t = Trainer(make(), lr=1e-3, warmup=10, total=100)
