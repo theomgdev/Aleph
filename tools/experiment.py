@@ -196,7 +196,11 @@ def show_samples(model, meta, a):
     print("\n--- samples ---")
     for prompt in ("Once upon a time", "The little girl", "Tom and Sara"):
         ids = torch.tensor([tok.encode(prompt)], device=a.device)
-        out = model.generate(ids, length=70, temperature=0.8, top_k=40)
+        # 0.6, not the conventional 0.8: measured mean predictive entropy here
+        # is 3.27 nats at top-1 probability 0.390, so 0.8 draws from the tail of
+        # a distribution that is genuinely uncertain, and the text degrades
+        # while the score does not.
+        out = model.generate(ids, length=70, temperature=a.temperature, top_k=40)
         print(f"  {prompt!r} -> {tok.decode(out[0].tolist())!r}")
 
 
@@ -451,7 +455,8 @@ def run_depends(a, meta):
         model.plastic.forward = saved
 
     for label, tensor in (('aux encoder (conv)', getattr(model.enc, 'weight', None)),
-                          ('aux readout adapter', model.dec_v)):
+                          ('aux readout adapter', model.dec_v),
+                          ('unigram logit bias', model.codebook.bias)):
         if tensor is None:
             continue
         saved = tensor.detach().clone()
@@ -461,7 +466,19 @@ def run_depends(a, meta):
         with torch.no_grad():
             tensor.copy_(saved)
 
+    # How much of the readout is context-dependent at all? The bias is one
+    # fixed vector added at every position, so comparing its spread against the
+    # state-dependent term says how much of a logit the core actually decided.
+    with torch.no_grad():
+        x, _ = va.next()
+        logits, _ = model(torch.as_tensor(x, device=a.device), window=0)
+        signal = (logits - model.codebook.bias).std(-1).mean().item()
+        bias = model.codebook.bias.std().item()
     print(f"  {'-' * 68}")
+    print(f"\n  readout decomposition: state-dependent std {signal:.4f}, "
+          f"fixed bias std {bias:.4f}")
+    print(f"  signal/bias = {signal / max(bias, 1e-9):.3f}"
+          "   (below 1 means most of a logit is a corpus statistic)")
     print("\n  A branch whose removal costs nothing was not doing anything. A cache\n"
           "  whose horizon stops mattering past k is reading k tokens back, not\n"
           "  the window it was given.")
@@ -534,6 +551,10 @@ def parse_args():
     g.add_argument('--log-every', type=int, default=50)
     g.add_argument('--eval-every', type=int, default=500)
     g.add_argument('--sample', action='store_true')
+    g.add_argument('--temperature', type=float, default=0.6,
+                   help="Sampling temperature for --sample. 0.6 rather than 0.8: "
+                        "this model's predictive entropy is 3.27 nats, so 0.8 "
+                        "samples the tail.")
     g.add_argument('--ablate', default=None, metavar='AXIS=V1,V2',
                    help="e.g. --ablate depth=0,4,8, or --ablate "
                         "branches=none+adamw,none,aux,attn,plastic,attn+plastic+aux "

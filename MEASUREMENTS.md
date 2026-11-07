@@ -453,3 +453,44 @@ and generation is the limiting chunk size of 1, so a bug of this shape always
 lands on the samples and never on the loss.
 
 And the samples earned their place in the report. No aggregate caught this.
+
+## Why the samples lag the score
+
+After the decode fix the generated text improved but still dropped function
+words and inserted commas at every temperature, including greedy — so this is
+not a sampling artifact. Two measurements locate it.
+
+**Sampling temperature was wrong for this model.** Teacher-forced on validation
+text, the predictive distribution has mean entropy 3.27 nats and mean top-1
+probability 0.390. That is a genuinely uncertain distribution, and `T=0.8` on
+top of it is aggressive. Free-running entropy stays flat across 70 tokens
+(3.2–4.0 nats, no upward drift), so the model is not degenerating — the sampler
+was just drawing from the tail. At `T=0.6` the same checkpoint produces *"in a
+small house, there, a little girl named Lily. She loved to play with her
+blocks."* The default is now 0.6; 0.8 is a knob, not a given.
+
+**And half the logit signal is a constant.** Decomposing the readout
+`h @ Hᵀ · out_scale + bias` on real text at step 2,000:
+
+| term | std across the vocabulary |
+|---|---|
+| state-dependent, `h @ Hᵀ · out_scale` | 2.5893 |
+| fixed unigram bias | 2.5439 |
+| ratio | 1.018 |
+
+The bias is one vector, identical at every position, and it contributes as much
+logit variance as the entire recurrence, attention, plasticity and adapter
+combined. That is consistent with both observations rather than contradicting
+either: the unigram prior is worth 3.9 bits, so it genuinely improves bits per
+byte, while at any single position the context-dependent part has only half the
+say — which is exactly how a frequent token wins a slot that grammar had
+already claimed.
+
+It is also a caution about this project's own thesis. The frozen interface
+removed a 4.2M-parameter dictionary, and a 4,096-entry logit bias is a much
+smaller dictionary doing a smaller version of the same job. Those 4,609
+interface parameters are honestly counted as trainable, but anyone reading the
+bits-per-byte figure as a measure of *computation* should know that about half
+the readout's variance at this checkpoint is a corpus statistic rather than
+something the core computed. The `--no-unigram` arm exists to measure that, and
+quoting it beside the headline number is the honest form.
