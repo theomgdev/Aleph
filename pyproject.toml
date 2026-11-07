@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aleph-lm"
+version = "0.1.0"
+description = "A language model that is one matrix: frozen token codes, a square recurrent core"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Cahit Karahan" }]
+keywords = ["language-model", "recurrent", "parameter-efficiency", "tiny-llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["torch>=2.4", "numpy>=1.24"]
+
+[project.optional-dependencies]
+data = ["datasets>=2.14", "tokenizers>=0.15"]
+dev = ["pytest>=7.4", "ruff>=0.4", "datasets>=2.14", "tokenizers>=0.15"]
+
+[tool.setuptools.packages.find]
+include = ["aleph*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

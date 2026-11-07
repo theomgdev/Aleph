@@ -1,0 +1,23 @@
+# Research notes: gitignored by design — reference material, not the library.
+Research/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+
+# Scratch, caches, checkpoints
+tmp/
+ckpt/
+*.bin
+*.part
+.pytest_cache/
+.ruff_cache/
+
+# Per-tool agent files stay local
+CLAUDE.md
+GEMINI.md
+.claude/
+.cursor/
