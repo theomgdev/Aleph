@@ -763,3 +763,51 @@ class TestColdStart:
         v = TokenStream(cache, 2, 8, 'val')
         t.run(s, v, 4, log_every=10, eval_every=0)
         assert m.attn._pos == 32
+
+
+class TestCachePortability:
+    """A cache built or tracked on one OS must not break another.
+
+    Two failure modes surfaced on Colab: a `.json` sidecar tracked in git
+    without its `.bin` memmap made `build_cache` report a 0s cache hit with no
+    data behind it, and a Windows backslash inside `meta['path']` failed to
+    open on Linux.
+    """
+
+    def test_orphan_json_without_bin_is_rebuilt_not_trusted(self, tmp_path):
+        from aleph.data.stream import ByteTokenizer, build_cache
+        tok = ByteTokenizer()
+        texts = ["Once upon a time there was a little cat.\n"] * 40
+        meta = build_cache(texts, tok, tmp_path, 'mini', verbose=False)
+        bin_path = pathlib.Path(meta['path'])
+        # Simulate a git clone that has the `.json` sidecar but not `.bin`.
+        bin_path.unlink()
+        rebuilt = build_cache(texts, tok, tmp_path, 'mini', verbose=False)
+        assert pathlib.Path(rebuilt['path']).exists()
+        assert '\\' not in rebuilt['path']
+
+    def test_find_cache_ignores_orphan_json_and_normalizes_separators(self, tmp_path):
+        import json
+        import pytest
+        import tools.experiment as X
+        from aleph.data.stream import ByteTokenizer, build_cache
+        tok = ByteTokenizer()
+        meta = build_cache(["hello world\n"] * 40, tok, tmp_path, 'real', verbose=False)
+        # Corrupt the stored path with Windows backslashes and a wrong prefix,
+        # and drop an alphabetically-later orphan `.json` with no `.bin`.
+        j = next(tmp_path.glob('real_*.json'))
+        raw = json.loads(j.read_text())
+        raw['path'] = "data" + chr(92) + "real_wrong.bin"
+        j.write_text(json.dumps(raw))
+        (tmp_path / 'zzzz_orphan_bpe4096_deadbeef.json').write_text(json.dumps(raw))
+
+        found = X.find_cache(tmp_path)
+        assert '\\' not in found['path']
+        assert pathlib.Path(found['path']).exists()
+        assert found['tokens'] == meta['tokens']
+
+        # And if no `.bin` exists at all, `find_cache` fails rather than
+        # returning a pointer to a missing file.
+        pathlib.Path(found['path']).unlink()
+        with pytest.raises(SystemExit):
+            X.find_cache(tmp_path)

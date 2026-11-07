@@ -44,6 +44,9 @@ class ByteTokenizer:
     def encode(self, text):
         return list(text.encode('utf-8', 'replace'))
 
+    def encode_batch(self, texts):
+        return [self.encode(t) for t in texts]
+
     def decode(self, ids):
         return bytes(i for i in ids if 0 <= i < 256).decode('utf-8', 'replace')
 
@@ -101,6 +104,9 @@ class BPETokenizer:
     def encode(self, text):
         return self._tok.encode(text).ids
 
+    def encode_batch(self, texts):
+        return [e.ids for e in self._tok.encode_batch(texts)]
+
     def decode(self, ids):
         return self._tok.decode([int(i) for i in ids])
 
@@ -120,9 +126,14 @@ def build_cache(texts, tokenizer, out_dir, name, val_frac=0.01, verbose=True):
                    val_frac=val_frac)
     base = out_dir / f"{name}_{tokenizer.name}{tokenizer.vocab_size}_{stamp[:8]}"
     meta_path = base.with_suffix('.json')
+    bin_path = base.with_suffix('.bin')
 
-    if meta_path.exists():
+    # Both files must exist: a tracked or copied `.json` without its `.bin`
+    # sidecar is not a cache hit, and `meta['path']` is resolved from the local
+    # path rather than trusting whichever OS separator was written into JSON.
+    if meta_path.exists() and bin_path.exists() and bin_path.stat().st_size > 0:
         meta = json.loads(meta_path.read_text())
+        meta['path'] = bin_path.as_posix()
         if verbose:
             print(f"  cache hit: {meta['train_tokens']:,} train / "
                   f"{meta['val_tokens']:,} val tokens  ({base.name})")
@@ -132,29 +143,40 @@ def build_cache(texts, tokenizer, out_dir, name, val_frac=0.01, verbose=True):
     # truncated cache that the next run reads as complete.
     part = base.with_suffix('.part')
     total, chars = 0, 0
+    batch_encode = getattr(tokenizer, 'encode_batch', None)
     try:
         with open(part, 'wb') as fh:
-            buf = []
-            for i, text in enumerate(texts):
+            buf, batch = [], []
+            for i, text in enumerate(texts, 1):
                 chars += len(text)
-                buf.extend(tokenizer.encode(text))
+                if batch_encode is not None:
+                    batch.append(text)
+                    if len(batch) >= 2048:
+                        for ids in batch_encode(batch):
+                            buf.extend(ids)
+                        batch.clear()
+                else:
+                    buf.extend(tokenizer.encode(text))
                 if len(buf) >= 1 << 20:
                     np.asarray(buf, dtype=np.uint16).tofile(fh)
                     total += len(buf)
                     buf = []
-                    if verbose and i % 20000 == 0:
-                        print(f"    {i:,} docs, {total:,} tokens", flush=True)
+                if verbose and i % 50000 == 0:
+                    print(f"    {i:,} docs, {total + len(buf):,} tokens", flush=True)
+            if batch:
+                for ids in batch_encode(batch):
+                    buf.extend(ids)
             if buf:
                 np.asarray(buf, dtype=np.uint16).tofile(fh)
                 total += len(buf)
-        part.replace(base.with_suffix('.bin'))
+        part.replace(bin_path)
     except BaseException:
         part.unlink(missing_ok=True)
         raise
 
     n_val = max(1, int(total * val_frac))
     meta = {
-        'path': str(base.with_suffix('.bin')), 'tokens': total,
+        'path': bin_path.as_posix(), 'tokens': total,
         'train_tokens': total - n_val, 'val_tokens': n_val,
         'vocab_size': tokenizer.vocab_size, 'tokenizer': tokenizer.name,
         'chars': chars, 'bytes_per_token': chars / max(total, 1), 'name': name,

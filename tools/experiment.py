@@ -55,12 +55,16 @@ ARCH_FIELDS = ('neurons', 'depth', 'rank', 'vocab', 'nnz', 'code', 'seed', 'cach
 
 def find_cache(data_dir, name=None):
     metas = sorted(pathlib.Path(data_dir).glob('*.json'))
-    metas = [m for m in metas if 'bpe_' not in m.name]
+    metas = [m for m in metas
+             if 'bpe_' not in m.name and m.with_suffix('.bin').exists()]
     if not metas:
         raise SystemExit(f"no cache in {data_dir}/ — run tools/build_corpus.py first")
     if name:
         metas = [m for m in metas if name in m.name] or metas
-    return json.loads(metas[-1].read_text())
+    chosen = metas[-1]
+    meta = json.loads(chosen.read_text())
+    meta['path'] = chosen.with_suffix('.bin').as_posix()
+    return meta
 
 
 def build(a, meta, verbose=True):

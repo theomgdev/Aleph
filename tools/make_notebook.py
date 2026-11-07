@@ -107,19 +107,27 @@ print(f"\\ncolab: {IN_COLAB}")
     md("Clone and install. `datasets` and `tokenizers` are the only additions; "
        "torch is already present on Colab."),
     code(f"""
+import importlib
 REPO = "{REPO}"
 if IN_COLAB:
-    if not pathlib.Path('aleph-repo').exists():
+    repo_dir = pathlib.Path('/content/aleph-repo')
+    if not repo_dir.exists():
         # A local copy works too: upload the repo and skip this cell.
-        r = subprocess.run(["git", "clone", "--depth", "1", REPO, "aleph-repo"],
+        r = subprocess.run(["git", "clone", "--depth", "1", REPO, str(repo_dir)],
                            capture_output=True, text=True)
         print(r.stdout or r.stderr)
-    if pathlib.Path('aleph-repo').exists():
-        os.chdir('aleph-repo')
+    else:
+        r = subprocess.run(["git", "-C", str(repo_dir), "pull", "--ff-only"],
+                           capture_output=True, text=True)
+        print(r.stdout or r.stderr)
+    os.chdir(repo_dir)
     subprocess.run([sys.executable, "-m", "pip", "install", "-q",
                     "datasets", "tokenizers"], check=False)
 
-sys.path.insert(0, os.getcwd())
+if os.getcwd() not in sys.path:
+    sys.path.insert(0, os.getcwd())
+for mod in [m for m in list(sys.modules) if m.startswith(('aleph', 'tools'))]:
+    importlib.reload(sys.modules[mod])
 from aleph import Codebook, AlephCore, Trainer, __version__
 print(f"aleph {{__version__}} from {{os.getcwd()}}")
 """),
@@ -153,17 +161,37 @@ The BPE fit and the encode together take a few minutes and are cached, so
 re-running this cell is free. `--stories` is the knob: 400k is ~130M tokens,
 enough that a sub-1M-parameter model is not the thing that runs out."""),
     code("""
-STORIES = 400_000     # ~130M tokens
+import shutil
+STORIES = 400_000     # ~92M tokens
 VOCAB   = 4096        # nearly free under the codebook, so chosen for sequence length
 
+# Restore from Drive if an earlier session already built the cache.
+if CKPT_DIR != 'ckpt':
+    for f in pathlib.Path(CKPT_DIR).glob('tinystories*.bin'):
+        j = f.with_suffix('.json')
+        if j.exists() and not (pathlib.Path('data') / f.name).exists():
+            pathlib.Path('data').mkdir(exist_ok=True)
+            shutil.copy2(f, pathlib.Path('data') / f.name)
+            shutil.copy2(j, pathlib.Path('data') / j.name)
+
 t0 = time.perf_counter()
-r = subprocess.run([sys.executable, "-u", "tools/build_corpus.py",
-                    "--tokenizer", "bpe", "--vocab", str(VOCAB),
-                    "--stories", str(STORIES)],
-                   capture_output=True, text=True)
-print(r.stdout[-2500:])
-if r.returncode:
-    print("STDERR:", r.stderr[-2000:])
+proc = subprocess.Popen([sys.executable, "-u", "tools/build_corpus.py",
+                         "--tokenizer", "bpe", "--vocab", str(VOCAB),
+                         "--stories", str(STORIES)],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, bufsize=1)
+for line in proc.stdout:
+    print(line, end='')
+proc.wait()
+if proc.returncode:
+    raise SystemExit(f"build_corpus failed (exit {proc.returncode})")
+
+if CKPT_DIR != 'ckpt':
+    for f in pathlib.Path('data').glob('tinystories*.bin'):
+        j = f.with_suffix('.json')
+        if j.exists() and not (pathlib.Path(CKPT_DIR) / f.name).exists():
+            shutil.copy2(f, pathlib.Path(CKPT_DIR) / f.name)
+            shutil.copy2(j, pathlib.Path(CKPT_DIR) / j.name)
 print(f"\\n[{time.perf_counter() - t0:.0f}s]")
 """),
 

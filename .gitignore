@@ -8,11 +8,15 @@ __pycache__/
 build/
 dist/
 
-# Scratch, caches, checkpoints
+# Scratch, caches, checkpoints (keep the BPE merge table, ignore built memmaps
+# and their per-machine sidecar JSONs so a clone never sees a `.json` without
+# its `.bin`)
 tmp/
 ckpt/
 *.bin
 *.part
+data/*.json
+!data/bpe_*.json
 .pytest_cache/
 .ruff_cache/
 
