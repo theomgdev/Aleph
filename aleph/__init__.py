@@ -7,8 +7,14 @@ the step instead of by echoing.
 
 __version__ = "0.1.0"
 
+from .core.attention import TemporalAttention
 from .core.codebook import Codebook
-from .core.core import AlephCore
+from .core.core import AlephCore, quantize_ste
+from .core.plasticity import Plasticity
+from .train.muon import MuonAdamW
 from .train.trainer import Trainer
 
-__all__ = ["Codebook", "AlephCore", "Trainer", "__version__"]
+__all__ = [
+    "Codebook", "AlephCore", "TemporalAttention", "Plasticity",
+    "quantize_ste", "Trainer", "MuonAdamW", "__version__",
+]

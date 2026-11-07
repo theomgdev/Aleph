@@ -45,15 +45,54 @@ h = RMSNorm( φ(s) + Σ_k φ(RMSNorm(φ(s)) @ U_k) @ V_k )
 capacity inside a step rather than by echoing — see below for why that
 distinction decides the design.
 
+Three branches then read the whole trajectory, once per call rather than once
+per token, which is what makes them affordable:
+
+```
+h_seq += attention(h_seq)        # queries a cache of earlier states, over time
+h_seq += plasticity(h_seq)       # a D×D fast-weight matrix written per stream
+h_seq += readout_adapter(h_seq)  # rotates the state into the codebook's frame
+```
+
+**Attention** has no layers to sit between, so it attends along time: one KV
+head, RoPE at absolute stream position, and the cache crosses forward calls
+detached — so a short chunk still sees a long past.
+
+**Plasticity** is a fast-weight matrix per stream, written by the sequence
+rather than trained. It writes the *error*, `S ← decay·S + (v − Sk)kᵀ·β`, so a
+repeat write is a no-op and a stale association is erased rather than
+accumulated; `β` is a full per-synapse gate field. The matrix is an activation,
+not a parameter: 1,024 floats of memory per stream at `D=32`, against the 512
+the state vector holds.
+
+**The readout adapter** is the cheapest and the most effective per parameter.
+Without it the state has to be recurrent memory *and* point along a frozen
+random code at once; a rank-64 rotation separates those two jobs.
+
+All three are zero-initialized at their output, so switching one on changes
+nothing at step 0 and an ablation differs in exactly one variable.
+
 ## What the measurements decided
 
-Every number here was taken on an RTX 3060 Ti, and three of them overturned a
+Every number here was taken on an RTX 3060 Ti, and several of them overturned a
 choice I had made from reasoning.
 
 **The loop is launch-bound, severely.** 128× the batch cost 1.15× the time —
 1,042 tok/s at batch 1 against 115,851 at batch 128. The clock tracks kernel
 launches, not arithmetic, which means batch is nearly free and arithmetic
-inside an existing launch is nearly free too.
+inside an existing launch is nearly free too. At `B=64, T=256` the recurrence
+is 308.3 ms of a 314.3 ms step, while the readout and cross-entropy over
+`V=4096` — 206 GFLOPs against the recurrence's 25.7 — take 19.6 ms. Ninety-eight
+percent of the time on eleven percent of the arithmetic.
+
+**So the sequence should be short and the batch wide.** The state and both
+branch caches cross forward calls, which makes `seq` a launch granularity
+rather than a context length: a token sees unbroken history and credit reaches
+`window` tokens back either way. At a fixed 16,384 tokens per step and
+identical peak VRAM (1,660 MiB), `(256, 64)` ran 3.6× faster than `(64, 256)` —
+158,085 against 50,439 tok/s — and scored *lower*, because a step averages over
+256 independent stream positions instead of 64. Largest speedup in the project,
+no cost, so it is the default.
 
 **So depth must be parallel, not chained.** A chained refinement stack
 (`r ← r + φ(norm(r) @ Uₖ) @ Vₖ`) needs `3·depth` sequential launches per token
@@ -63,9 +102,11 @@ wide matmul pair makes `depth` cost two launches whatever its value, and then
 time *saturates*: depth 4, 8 and 16 all cost ~151–158 ms while parameters go
 531k → 793k → 1.32M. Past depth 4 capacity is genuinely free.
 
-**`torch.compile` is a slowdown here: 0.88×** (274.90 ms eager against 310.68
-ms compiled). Inductor cannot fuse across a data-dependent Python loop and the
-per-step graph is too small to win on its own.
+**And autocast is a slowdown, not a speedup: 0.76×.** bf16 autocast inside the
+step loop casts the same three matrices once per token — 768 extra kernels per
+forward pass at `T=256` — on a loop that is already latency-bound. TF32 runs
+31% faster *and* more precisely. `torch.compile` loses too (0.88×): Inductor
+cannot fuse across a data-dependent Python loop.
 
 **Depth narrows the usable learning rate rather than destabilizing the model.**
 On a 64-sequence overfit, `depth=4` reached 0.0192 nats at lr 1e-3 and diverged
@@ -78,6 +119,21 @@ at one fixed rate measures the schedule instead of the mechanism.
 plus a logit bias seeded from corpus counts reaches 5.6239 nats against the
 distribution's true entropy of 5.5992 — essentially optimal, 3.9 bits below
 uniform, for 4,609 parameters.
+
+**Muon beats AdamW by 0.531 nats at zero parameter cost**, which makes it the
+largest single win in the table and the default. The advantage is in
+convergence rate rather than the final optimum, so it is invisible early: at 25
+steps AdamW is still ahead. A probe short enough to be cheap is long enough to
+reach the wrong conclusion.
+
+**int8 weights are free; ternary is not.** QAT on the recurrent operators costs
++0.014 nats at int8 (inside run-to-run noise, 4× smaller storage), +0.267 at
+int4 and +0.477 at ternary. That last figure independently reproduces the
+published +0.50 for sub-200M models, so it is recorded as a negative result:
+this architecture at this scale does not support 1.58-bit weights.
+
+Full tables, including the arms that lost, are in
+[`MEASUREMENTS.md`](MEASUREMENTS.md).
 
 ## Install
 
@@ -92,6 +148,9 @@ python tools/build_corpus.py --tokenizer bpe --vocab 4096 --stories 400000
 python tools/experiment.py --mode smoke                   # wiring, in seconds
 python tools/experiment.py --mode train --steps 6000 --sample
 python tools/experiment.py --mode ablate --ablate depth=0,4,8,16
+python tools/experiment.py --mode ablate \
+       --ablate branches=none+adamw,none,aux,attn,plastic,attn+plastic+aux
+python tools/experiment.py --mode ablate --ablate quant=none,int8,int4,ternary
 python tools/experiment.py --mode eval --tag main --sample # re-score, no GPU time
 ```
 
@@ -101,7 +160,7 @@ from aleph import Codebook, AlephCore, Trainer
 cb = Codebook(vocab=4096, width=512)          # 4,609 trainable
 model = AlephCore(neurons=512, codebook=cb, depth=8)
 print(model.param_report())
-# {'core': 261632, 'refine': 524288, 'interface': 4609, 'modulation': 2560, ...}
+# {'core': 261632, 'refine': 524288, 'interface': 4609, 'modulation': 236640, ...}
 ```
 
 Colab: [`notebooks/aleph_colab.ipynb`](notebooks/aleph_colab.ipynb) runs the
@@ -119,13 +178,20 @@ tested rather than documented:
   explosion and vanishing are both structurally impossible regardless of `W`'s
   spectral radius — which is why no spectral constraint, clamp or learnable
   decay appears anywhere. Measured 15.999998 at `N=256`.
-- **Every optional mechanism starts inert.** `V` is zero-initialized and
-  `self_gain` is zero, so `depth` and the latch change nothing until training
-  moves them: the same seed gives the same `W` at any depth, and an ablation arm
-  differs from its baseline in one variable. Three parameter families
-  consequently take **no gradient at step 0** — `U`, `r_norm` and `self_logit`
-  sit behind a zero factor. That is the design working, not a detached graph;
-  they open on their own schedule (measured: `U` reaches `|g| = 0.62` by step 6).
+- **Every optional mechanism starts inert.** `V` is zero-initialized, `self_gain`
+  is zero, and all three branches are zero-initialized at their output
+  projection, so `depth`, the latch, attention, plasticity and the adapter
+  change nothing until training moves them: the same seed gives the same `W` in
+  every configuration, and an ablation arm differs from its baseline in one
+  variable. Several parameter families consequently take **no gradient at step
+  0** — everything behind a zero factor. That is the design working, not a
+  detached graph; they open on their own schedule (measured: `U` reaches
+  `|g| = 0.62` by step 6, and all 31 tensors have moved by step 12).
+- **The caches belong to the sequence, not the module.** Attention's KV cache
+  and plasticity's fast-weight trace cross forward calls carrying value but not
+  gradient — the same contract the hidden state has — and are reset whenever
+  `state=None` arrives, so a new document cannot attend to the previous one's
+  history. A chunked run and a whole-sequence run agree to 1e-4.
 - **The code table never moves.** It is a buffer, not a parameter.
 
 ## What may and may not be claimed
@@ -152,13 +218,16 @@ with any comparison — including between two of our own runs.
 
 ```
 aleph/core/codebook.py    frozen token codes; the V+N+1 interface
-aleph/core/core.py        the square recurrent core
+aleph/core/core.py        the square recurrent core, branches, QAT
+aleph/core/attention.py   temporal attention over the state history
+aleph/core/plasticity.py  delta-rule fast weights at synaptic resolution
 aleph/data/stream.py      tokenizers, token cache, B-cursor stream
 aleph/train/trainer.py    warmup/cosine, truncated BPTT, telemetry
+aleph/train/muon.py       Muon on the operators, AdamW on everything else
 tools/build_corpus.py     TinyStories -> uint16 token cache
 tools/experiment.py       train / smoke / ablate / eval
 tools/make_notebook.py    generates the Colab notebook
-tests/test_aleph.py       40 tests, CPU, ~4s
+tests/test_aleph.py       73 tests, CPU, ~15s
 ```
 
 `Research/` is gitignored: reference material, not library.

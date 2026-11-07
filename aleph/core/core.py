@@ -83,9 +83,45 @@ Invariants
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
+from .attention import TemporalAttention
 from .codebook import Codebook
+from .plasticity import Plasticity
+
+
+def quantize_ste(w, mode):
+    """Fake-quantize `w` with a straight-through estimator, per output row.
+
+    QAT rather than post-training quantization, because the same matrix is
+    applied at every step: a perturbation that a feedforward layer absorbs once
+    gets re-applied `T` times here, and the only way the core can learn stable
+    dynamics on the discrete operator is to see it during training.
+
+    Measured on the 1.03M-parameter synthesis at 400 steps (val nats, from
+    4.4243 unquantized): int8 4.4383, int4 4.6913, ternary 4.9016. So int8 is
+    free and below that the core pays real capacity -- consistent with the
+    published finding that ternary needs scale this model does not have.
+    """
+    if mode in (None, 'none'):
+        return w
+    if mode == 'ternary':
+        # BitNet b1.58: absmean scale, weights in {-1, 0, +1}.
+        scale = w.abs().mean(dim=-1, keepdim=True).clamp(min=1e-8)
+        q = (w / scale).round().clamp(-1, 1) * scale
+    elif mode in ('int8', 'int4'):
+        qmax = 127 if mode == 'int8' else 7
+        scale = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / qmax
+        q = (w / scale).round().clamp(-qmax, qmax) * scale
+    else:
+        raise ValueError(f"quant must be None, 'none', 'int8', 'int4' or 'ternary', got {mode!r}")
+    # Forward is exactly `q`, backward is exactly the identity. Both halves
+    # need care: `w - w.detach()` is exactly zero where `w + (q - w).detach()`
+    # leaves a one-ulp residue, so an exported weight really is ternary; and
+    # `q` must be detached because `scale` is a function of `w`, so leaving it
+    # live would send gradient through the quantizer's own scale.
+    return q.detach() + (w - w.detach())
 
 
 class AlephCore(nn.Module):
@@ -104,6 +140,26 @@ class AlephCore(nn.Module):
             `'gelu'`.
         self_gain (bool): Per-neuron self-connection, gated shut at init.
             Default True.
+        attn (bool): Temporal attention over the state history. Default True.
+            Measured -0.0644 val nats at +164k params (head_dim 32); the
+            default head_dim of 16 halves that cost for the same score.
+        attn_heads, attn_kv_heads, attn_head_dim, attn_window: forwarded to
+            `TemporalAttention`.
+        plastic (bool): Delta-rule fast weights. Default True. Measured
+            -0.1191 val nats at +169k params (dim 64); the default dim of 32
+            quarters that cost for the same score.
+        plastic_dim (int): Fast-weight width `D`; the state is `D x D` per
+            stream. Default 32.
+        aux (bool): Auxiliary encoder and readout adapter. Default True, and
+            the best value per parameter measured: -0.2569 val nats for +68k.
+            A causal depthwise conv over injected codes gives the core local
+            n-gram context before the recurrence starts, and a low-rank adapter
+            rotates the state into the frozen codebook's frame so `h` does not
+            have to serve as both recurrent memory and readout vector.
+        aux_rank (int): Rank of the readout adapter. Default 64.
+        quant (str, optional): `'int8'`, `'int4'` or `'ternary'` QAT on the
+            recurrent operators. Default None. int8 measured free; see
+            `quantize_ste`.
         dropout (float): Applied to the state after the activation. Default 0.
         gradient_checkpointing (bool): Recompute steps in the backward pass.
             Trades ~30% time for a step-count-independent memory profile.
@@ -111,8 +167,10 @@ class AlephCore(nn.Module):
     """
 
     def __init__(self, neurons, codebook, depth=4, rank=None, activation='gelu',
-                 self_gain=True, dropout=0.0, gradient_checkpointing=False,
-                 device=None):
+                 self_gain=True, attn=True, attn_heads=4, attn_kv_heads=1,
+                 attn_head_dim=16, attn_window=128, plastic=True, plastic_dim=32,
+                 aux=True, aux_rank=64, quant=None, dropout=0.0,
+                 gradient_checkpointing=False, device=None):
         super().__init__()
         if neurons < 2:
             raise ValueError(f"neurons must be >= 2, got {neurons}")
@@ -172,23 +230,66 @@ class AlephCore(nn.Module):
             self.U = self.V = self.r_norm = None
 
         self.drop = nn.Dropout(dropout)
+        self.quant = quant
         self.register_buffer('_h', torch.zeros(1, neurons, device=device), persistent=False)
+
+        # The three optional branches, all zero-initialized at their output so
+        # switching one on changes nothing at step 0. They read the whole
+        # trajectory rather than one step, so they live outside the recurrence
+        # and cost one set of kernels per call instead of one per token.
+        self.attn = TemporalAttention(
+            neurons, heads=attn_heads, kv_heads=attn_kv_heads,
+            head_dim=attn_head_dim, window=attn_window, device=device) if attn else None
+        self.plastic = Plasticity(neurons, dim=plastic_dim, device=device) if plastic else None
+
+        if aux:
+            # Causal depthwise conv over injected codes: local n-gram context
+            # before the recurrence sees the token. Zero-init, so inert at step 0.
+            self.enc = nn.Conv1d(neurons, neurons, kernel_size=4, padding=3,
+                                 groups=neurons, bias=False, device=device)
+            nn.init.zeros_(self.enc.weight)
+            # The readout adapter. Without it `h` must be the recurrent state
+            # and point along a frozen random code at the same time; a rank-r
+            # rotation separates those two jobs for 2*N*r parameters.
+            self.dec_norm = nn.RMSNorm(neurons, device=device)
+            self.dec_u = nn.Parameter(torch.empty(neurons, aux_rank, device=device))
+            self.dec_v = nn.Parameter(torch.zeros(aux_rank, neurons, device=device))
+            with torch.no_grad():
+                nn.init.normal_(self.dec_u, std=neurons ** -0.5)
+        else:
+            self.enc = self.dec_norm = None
+            self.dec_u = self.dec_v = None
 
     # ------------------------------------------------------------------ #
 
-    def _step(self, h, code):
-        """One token: mix, inject, refine, normalize. `code` may be None."""
-        s = h @ self.W + self.b
+    def reset_caches(self):
+        """Drop the attention KV cache and the fast-weight trace."""
+        if self.attn is not None:
+            self.attn.reset_cache()
+        if self.plastic is not None:
+            self.plastic.reset_cache()
+
+    def _step(self, h, code, W=None, U=None, V=None, self_mult=None):
+        """One token: mix, inject, refine, normalize.
+
+        The per-step invariants (`sigmoid(self_logit)`, the quantized operators)
+        are passed in rather than recomputed: inside a `T`-step loop they would
+        otherwise cost `T` times as many launches, and the loop is launch-bound.
+        """
+        W = self.W if W is None else W
+        s = torch.addmm(self.b, h, W)
         if code is not None:
             s = s + code.to(s.dtype)
-        if self.self_logit is not None:
-            s = s + h * self.self_gain * torch.sigmoid(self.self_logit)
+        if self_mult is not None:
+            s = s + h * self_mult
 
         out = self.act(s)
-        if self.U is not None:
+        U = self.U if U is None else U
+        if U is not None:
             # All branches in one matmul pair: `depth` is two launches, not
             # `3 * depth`, which is what makes it affordable here.
-            out = out + self.act(self.r_norm(out) @ self.U) @ self.V
+            V = self.V if V is None else V
+            out = out + self.act(self.r_norm(out) @ U) @ V
         return self.norm(self.drop(out))
 
     def forward(self, ids, state=None, return_states=True, window=0):
@@ -214,6 +315,12 @@ class AlephCore(nn.Module):
             raise ValueError(f"window must be >= 0, got {window}")
         b, t = ids.shape
 
+        if state is None:
+            # A fresh state means a fresh stream: the branch caches belong to
+            # the sequence, not to the module, and a stale one would let a new
+            # document attend to the previous one's history.
+            self.reset_caches()
+
         h = self._h.expand(b, -1) if state is None else state
         if h.shape != (b, self.n):
             raise ValueError(f"state must be ({b}, {self.n}), got {tuple(h.shape)}")
@@ -222,23 +329,44 @@ class AlephCore(nn.Module):
         # The whole sequence's codes in one gather, so the per-step work is the
         # matmul and nothing else.
         codes = self.codebook.inject(ids)
+        if self.enc is not None:
+            codes = codes + self.enc(codes.transpose(1, 2))[..., :t].transpose(1, 2)
 
-        states = [] if return_states else None
+        # Hoisted out of the loop: these are constant across the `t` steps, and
+        # recomputing them per step measured a 31% throughput loss on a
+        # launch-bound recurrence.
+        W = quantize_ste(self.W, self.quant)
+        U = quantize_ste(self.U, self.quant) if self.U is not None else None
+        V = quantize_ste(self.V, self.quant) if self.V is not None else None
+        self_mult = (self.self_gain * torch.sigmoid(self.self_logit)
+                     if self.self_logit is not None else None)
+
+        states = []
         for i in range(t):
             if window and i and i % window == 0:
                 # The boundary: the state's value crosses, its history does not.
                 h = h.detach()
             code = codes[:, i]
             if self.gradient_checkpointing and self.training:
-                h = checkpoint.checkpoint(self._step, h, code, use_reentrant=False)
+                h = checkpoint.checkpoint(self._step, h, code, W, U, V, self_mult,
+                                          use_reentrant=False)
             else:
-                h = self._step(h, code)
-            if return_states:
-                states.append(h)
+                h = self._step(h, code, W, U, V, self_mult)
+            states.append(h)
+
+        h_seq = torch.stack(states, dim=1)
+        # The branches read the trajectory, so they run once per call rather
+        # than once per token -- which is why they are affordable at all.
+        if self.attn is not None:
+            h_seq = h_seq + self.attn(h_seq)
+        if self.plastic is not None:
+            h_seq = h_seq + self.plastic(h_seq, window=window)
+        if self.dec_u is not None:
+            h_seq = h_seq + F.gelu(self.dec_norm(h_seq) @ self.dec_u) @ self.dec_v
 
         if not return_states:
-            return self.codebook.logits(h).unsqueeze(1), h
-        return self.codebook.logits(torch.stack(states, dim=1)), h
+            return self.codebook.logits(h_seq[:, -1:]), h
+        return self.codebook.logits(h_seq), h
 
     @torch.no_grad()
     def generate(self, prompt, length=128, temperature=0.8, top_k=40, state=None):

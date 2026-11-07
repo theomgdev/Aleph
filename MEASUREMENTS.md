@@ -243,3 +243,101 @@ TinyStories-1M (Eldan & Li 2023, arXiv:2305.07759) at 0.40M non-embedding
 parameters against Aleph's 0.79M core+refine, scored by GPT-4 rubric rather
 than bits per byte — so the two numbers are not comparable as they stand, and
 saying otherwise would be the exact error `README.md` warns about.
+
+## The synthesis
+
+Four mechanisms, each measured on its own at 400 steps and 16,384 tokens per
+step from seed 0 (6.55M tokens), `N=512, depth=8, window=32`. Every optional
+branch is zero-initialized at its output projection, so all arms share an
+identical loss at step 0 and the difference is the mechanism rather than the
+initialization.
+
+| arm | params | train | val nats | val bpb | Δ nats | tok/s |
+|---|---|---|---|---|---|---|
+| AdamW, `B=64, T=256` | 793,089 | 5.2518 | 5.3332 | 1.9530 | — | 30,935 |
+| AdamW, `B=256, T=64` | 793,089 | 5.2518 | 5.2949 | 1.9390 | −0.038 | 112,128 |
+| + Muon | 793,089 | 4.6852 | 4.7643 | 1.7447 | −0.531 | 105,388 |
+| + aux encoder/readout | 861,185 | 4.4233 | 4.5074 | 1.6506 | −0.257 | 101,709 |
+| + temporal attention | 957,505 | 4.6025 | 4.6999 | 1.7211 | −0.064 | 90,767 |
+| + delta plasticity | 961,665 | 4.5694 | 4.6452 | 1.7011 | −0.119 | 76,473 |
+| all four | 1,194,177 | 4.3030 | 4.4094 | 1.6147 | −0.885 | 78,119 |
+| all four, compact | 1,027,169 | 4.3354 | 4.4243 | 1.6202 | −0.871 | 72,070 |
+
+Each Δ is against the `B=256, T=64` Muon arm for the three branches, and
+against AdamW for Muon itself. The compact row halves attention's `head_dim`
+(32 → 16) and quarters plasticity's `dim` (64 → 32): −167k parameters for
++0.015 nats, so compact is the better point and is the default.
+
+The integrated library reproduces the compact row at 4.4179 nats — 0.006 below
+the probe, because constructing the branches inside `__init__` draws RNG in a
+different order than bolting them on afterwards.
+
+### Geometry: wide and short is free
+
+The state and both branch caches cross forward calls, so `seq` is a launch
+granularity rather than a context length — a token sees unbroken history and
+credit reaches `window` tokens back either way. At a fixed 16,384 tokens per
+step and `window=32`:
+
+| batch | seq | ms/step | tok/s | peak VRAM |
+|---|---|---|---|---|
+| 64 | 256 | 324.8 | 50,439 | 1,660.4 MiB |
+| 128 | 128 | 169.4 | 96,716 | 1,660.0 MiB |
+| 256 | 64 | 103.6 | 158,085 | 1,659.9 MiB |
+| 512 | 32 | 72.4 | 226,429 | 1,659.8 MiB |
+
+Identical token count, identical credit horizon, identical memory, 4.5× the
+throughput. The mechanism is the launch bound: 16,384 tokens at `T=256` is 256
+sequential step launches, at `T=64` it is 64 launches over 4× wider matrices.
+The loss moved the right way too (1.9530 → 1.9390), because a step averages
+over 256 independent stream positions instead of 64.
+
+This is the largest speedup in the project and it has no cost, which is why
+`(256, 64)` is the default geometry.
+
+### Where the time goes
+
+At `B=64, T=256` the recurrence is 308.3 ms of a 314.3 ms step. The readout and
+cross-entropy over `V=4096` — 206 GFLOPs against the recurrence's 25.7 — take
+19.6 ms in fp32 and 14.9 in bf16. So 98% of the time is spent on 11% of the
+arithmetic: the loop is latency-bound, not compute-bound, and the only thing
+that matters is how many sequential launches it issues.
+
+### Quantization-aware training
+
+QAT on `W`, `U`, `V` with a straight-through estimator, measured on the compact
+synthesis at 400 steps:
+
+| precision | val nats | val bpb | Δ nats |
+|---|---|---|---|
+| fp32/tf32 | 4.4243 | 1.6202 | — |
+| int8 | 4.4383 | 1.6253 | +0.014 |
+| int4 | 4.6913 | 1.7180 | +0.267 |
+| ternary (1.58-bit) | 4.9016 | 1.7950 | +0.477 |
+
+int8 is free — 4× smaller weight storage for a difference inside run-to-run
+noise. Below that the core pays real capacity. The ternary penalty of +0.477
+nats independently reproduces the published expectation (+0.50 for sub-200M
+models, `Research/22-quantization-and-qat.md`), so it is recorded as a negative
+result: this architecture at this scale does not support ternary weights, and
+no configuration was sought that would make it pass.
+
+The STE needs both halves detached to be correct, which is a bug worth
+recording because nothing downstream would have revealed it. Writing
+`q + (w - w.detach())` rather than `w + (q - w).detach()` makes the forward
+value exactly `q` instead of one ulp away — so an exported weight is literally
+ternary. But `q` must *also* be detached: `scale` is a function of `w`, so a
+live `q` sends gradient through the quantizer's own scale, and the measured
+per-weight gradient came back in [0.69, 1.31] instead of 1.0. Both runs would
+have trained and neither loss curve would have looked wrong.
+
+### Muon, reconsidered
+
+An earlier probe put Muon behind AdamW (2.0633 against 1.9371 bpb). That probe
+had `set_lr` overwriting `muon_lr`, so the Muon group was running at the AdamW
+rate. With that fixed and the RMS matching at `0.2·sqrt(max(A,B))`, Muon leads
+by 0.531 nats at zero parameter cost — the largest single win in the table.
+
+The advantage is in convergence *rate*, not in the final optimum, so it is
+invisible early: at 25 steps AdamW is still ahead by 0.20 nats. A probe short
+enough to be cheap is long enough to reach the wrong conclusion here.

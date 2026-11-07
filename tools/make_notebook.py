@@ -54,6 +54,26 @@ Johnson–Lindenstrauss: the typical inner product between two of them is
 `N^(-1/2)` (0.044 at `N=512`, measured 0.0442 at every density), so `V` enters
 only logarithmically and a wider vocabulary is nearly free.
 
+**What the freed budget buys.** With the dictionary gone, nearly every
+trainable parameter is computation, and four mechanisms were measured onto that
+budget — each on its own, at matched seed, zero-initialized at its output so
+every arm starts from an identical loss:
+
+- **Temporal attention** over the core's own state history. There are no layers
+  to stack attention between, so it attends along *time*: each step queries a
+  cache of earlier states. One KV head, RoPE at absolute stream position, and
+  the cache crosses calls detached.
+- **Delta-rule plasticity** — a `D×D` fast-weight matrix per stream, written by
+  the sequence rather than trained. It writes the *error* (`v − Sk`) rather than
+  the value, so a repeat write is a no-op and a stale association is erased
+  instead of accumulated; `beta` is a full per-synapse gate field.
+- **An auxiliary encoder and readout adapter** — a causal depthwise conv over
+  injected codes, and a low-rank rotation into the codebook's frame so the
+  state is not asked to be recurrent memory and a readout direction at once.
+  Cheapest of the four and the most effective per parameter.
+- **Muon** on every 2D operator, which costs no parameters at all and was the
+  single largest win.
+
 **What this notebook produces.** A trained model, a bits-per-byte score on
 held-out text, the parameter report broken out by role, and the matched-seed
 ablation arms that turn a number into a claim.
@@ -75,8 +95,9 @@ if torch.cuda.is_available():
     p = torch.cuda.get_device_properties(0)
     print(f"  {p.name}  {p.total_memory / 2**30:.1f} GiB  sm_{p.major}{p.minor}  {p.multi_processor_count} SMs")
     print(f"  bf16 supported: {torch.cuda.is_bf16_supported()}")
-    # A recurrent core multiplies the same matrix every step, so fp16's narrow
-    # exponent is the wrong trade. bf16 where available, fp32 otherwise.
+    # TF32 rather than autocast: the step applies the same few matrices T
+    # times, so casting them per step costs 3*T extra kernels on a loop that
+    # is already launch-bound — measured 31% slower than this, and less precise.
     torch.set_float32_matmul_precision('high')
 
 IN_COLAB = 'google.colab' in sys.modules
@@ -178,13 +199,22 @@ if r.returncode:
 
     md("""## 4 — The run
 
-Three facts measured on an RTX 3060 Ti set these defaults, and they are worth
+Four facts measured on an RTX 3060 Ti set these defaults, and they are worth
 knowing before changing them:
 
 **The loop is launch-bound.** 128× the batch cost 1.15× the time — 1,042 tok/s
 at batch 1 against 115,851 at batch 128. Batch is therefore nearly free and
 should be as large as memory allows; it is the first thing to raise on a bigger
 GPU.
+
+**Wide and short beats narrow and long, for free.** The state and both branch
+caches cross calls, so `seq` is a launch granularity rather than a context
+length: a token still sees unbroken history and credit still reaches `window`
+tokens back either way. At a fixed 16,384 tokens per step and identical VRAM
+(1,660 MiB), `(batch 256, seq 64)` ran 3.6× faster than `(64, 256)` — 158,085
+against 50,439 tok/s — *and* scored lower, because the step averages over 256
+independent stream positions instead of 64. This is the single largest speedup
+in the project and it costs nothing.
 
 **`depth` saturates in time but not in capacity.** Branches are concatenated
 into one wide matmul pair, so depth 4, 8 and 16 all cost ~151–158 ms while
@@ -202,8 +232,9 @@ free = torch.cuda.get_device_properties(0).total_memory / 2**30 if torch.cuda.is
 CFG = dict(
     neurons = 512,     # core is N^2; the matrix IS the model
     depth   = 8,       # free in time past 4, so take the capacity
-    batch   = 256 if free > 30 else (128 if free > 14 else 32),
-    seq     = 256,     # also the truncated-BPTT window: credit spans a chunk
+    batch   = 512 if free > 30 else (256 if free > 14 else 64),
+    seq     = 64,      # launch granularity, not context: state carries across
+    window  = 32,      # how far credit travels back, independent of seq
     steps   = 6000,
     lr      = 1e-3,
     warmup  = 300,
@@ -225,6 +256,7 @@ columns."""),
 args = [sys.executable, "-u", "tools/experiment.py", "--mode", "train",
         "--neurons", str(CFG['neurons']), "--depth", str(CFG['depth']),
         "--batch", str(CFG['batch']), "--seq", str(CFG['seq']),
+        "--window", str(CFG['window']),
         "--steps", str(CFG['steps']), "--lr", str(CFG['lr']),
         "--warmup", str(CFG['warmup']), "--ckpt", CKPT_DIR,
         "--tag", "main", "--sample", "--resume"]
@@ -278,6 +310,72 @@ r = subprocess.run([sys.executable, "-u", "tools/experiment.py", "--mode", "abla
                     "--ablate", "neurons=128,256,512,768", "--steps", "1500",
                     "--depth", str(CFG['depth']), "--batch", str(CFG['batch']),
                     "--seq", str(CFG['seq'])],
+                   capture_output=True, text=True)
+print(r.stdout[-3000:])
+"""),
+
+    md("""### The synthesis arms
+
+Each of the three branches was measured on its own before being turned on by
+default, at 400 steps and 16,384 tokens per step from the same seed. All of
+them are zero-initialized at their output projection, so every arm starts at an
+identical loss and the difference is the mechanism rather than the
+initialization:
+
+| arm | params | val nats | Δ |
+|---|---|---|---|
+| AdamW baseline | 793,089 | 5.2949 | — |
+| + Muon | 793,089 | 4.7643 | −0.531 |
+| + aux encoder/readout | 861,185 | 4.5074 | −0.257 |
+| + temporal attention | 957,505 | 4.6999 | −0.064 |
+| + delta plasticity | 961,665 | 4.6452 | −0.119 |
+| all four | 1,194,177 | 4.4094 | −0.885 |
+
+Two things in that table are worth more than the totals. Muon is the largest
+single win and it costs *zero* parameters — it is the same model, trained
+differently, reaching in 400 steps what AdamW took 900 to reach. And the
+cheapest mechanism is the most effective: the aux encoder and readout adapter
+buy 0.257 nats for 68k parameters, because without them the state vector has to
+serve as recurrent memory and as a readout direction in a frozen random frame
+at the same time.
+
+The branches then stack almost additively, which is the evidence that they are
+doing different jobs rather than three versions of one.
+
+Re-run it to confirm on your own hardware — each arm is about 90 seconds on a
+T4, and the arms are independent so dropping one does not invalidate the
+rest."""),
+    code("""
+r = subprocess.run([sys.executable, "-u", "tools/experiment.py", "--mode", "ablate",
+                    "--ablate", "branches=none+adamw,none,aux,attn,plastic,attn+plastic+aux",
+                    "--steps", "400", "--batch", "256", "--seq", "64"],
+                   capture_output=True, text=True)
+print(r.stdout[-3500:])
+"""),
+
+    md("""### Quantization
+
+QAT on the recurrent operators, measured rather than assumed. The same matrix
+is applied at every step, so a perturbation a feedforward layer would absorb
+once gets re-applied `T` times here — which is why this is quantization-*aware*
+training rather than a post-training pass:
+
+| precision | val nats | Δ |
+|---|---|---|
+| fp32/tf32 | 4.4243 | — |
+| int8 | 4.4383 | +0.014 |
+| int4 | 4.6913 | +0.267 |
+| ternary (1.58-bit) | 4.9016 | +0.477 |
+
+int8 is free: 4× smaller weight storage for a difference inside run-to-run
+noise. Below that the core pays real capacity, and the ternary figure lands on
+the published expectation that 1.58-bit needs scale this model does not
+have — so it is reported as a negative result rather than tuned until it
+passes."""),
+    code("""
+r = subprocess.run([sys.executable, "-u", "tools/experiment.py", "--mode", "ablate",
+                    "--ablate", "quant=none,int8,int4,ternary",
+                    "--steps", "400", "--batch", "256", "--seq", "64"],
                    capture_output=True, text=True)
 print(r.stdout[-3000:])
 """),

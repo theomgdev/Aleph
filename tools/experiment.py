@@ -31,8 +31,13 @@ from aleph.train.trainer import Trainer  # noqa: E402
 # The knobs a user actually turns mid-investigation, in one block.
 NEURONS = 512
 DEPTH = 8
-BATCH = 128
-SEQ = 256
+# Wide and short. Every token still sees an unbroken state and every gradient
+# still reaches 32 tokens back -- the carry across calls makes `seq` a launch
+# granularity, not a context length. At a fixed 16,384 tokens per step,
+# (256, 64) measured 3.6x faster than (64, 256) *and* scored lower, because
+# the step averages over 256 independent stream positions instead of 64.
+BATCH = 256
+SEQ = 64
 STEPS = 4000
 LR = 1e-3
 WARMUP = 200
@@ -71,12 +76,21 @@ def build(a, meta, verbose=True):
         cb.set_unigram(unigram_counts(meta, meta['vocab_size']))
     model = AlephCore(a.neurons, cb, depth=a.depth, rank=a.rank,
                       activation=a.activation, dropout=a.dropout,
+                      attn=not a.no_attn, attn_heads=a.attn_heads,
+                      attn_head_dim=a.attn_head_dim, attn_window=a.attn_window,
+                      plastic=not a.no_plastic, plastic_dim=a.plastic_dim,
+                      aux=not a.no_aux, aux_rank=a.aux_rank, quant=a.quant,
                       gradient_checkpointing=a.checkpoint, device=dev).to(dev)
 
     if verbose:
         r = model.param_report()
         conv = 2 * meta['vocab_size'] * a.neurons
+        branches = [n for n, on in (('attn', model.attn is not None),
+                                    ('plastic', model.plastic is not None),
+                                    ('aux', model.enc is not None)) if on]
         print(f"  N={a.neurons} depth={a.depth} rank={model.rank} V={meta['vocab_size']}")
+        print(f"  branches: {', '.join(branches) or 'none'}"
+              f"{'  quant=' + a.quant if a.quant else ''}")
         print(f"  trainable {r['total']:,}  = core {r['core']:,} + refine {r['refine']:,}"
               f" + interface {r['interface']:,} + mod {r['modulation']:,}")
         print(f"  interface vs a learned embed+head: {r['interface']:,} against "
@@ -89,7 +103,11 @@ def build(a, meta, verbose=True):
 def arch_of(a, meta):
     return {'neurons': a.neurons, 'depth': a.depth, 'rank': a.rank,
             'vocab': meta['vocab_size'], 'nnz': a.nnz, 'code': a.code,
-            'seed': a.seed, 'cache': pathlib.Path(meta['path']).name}
+            'seed': a.seed, 'cache': pathlib.Path(meta['path']).name,
+            'attn': not a.no_attn, 'attn_heads': a.attn_heads,
+            'attn_head_dim': a.attn_head_dim, 'attn_window': a.attn_window,
+            'plastic': not a.no_plastic, 'plastic_dim': a.plastic_dim,
+            'aux': not a.no_aux, 'aux_rank': a.aux_rank, 'quant': a.quant}
 
 
 def streams(a, meta):
@@ -102,7 +120,7 @@ def run_train(a, meta):
     tr, va = streams(a, meta)
     trainer = Trainer(model, lr=a.lr, warmup=a.warmup, total=a.steps,
                       weight_decay=a.weight_decay, window=a.window,
-                      device=torch.device(a.device))
+                      optimizer=a.optimizer, device=torch.device(a.device))
 
     ck = pathlib.Path(a.ckpt) / f"aleph_{a.tag}.pt"
     ck.parent.mkdir(parents=True, exist_ok=True)
@@ -177,13 +195,26 @@ def run_ablate(a, meta):
     print(f"ablating {axis} over {values} at seed {a.seed}, {a.steps} steps each\n")
     rows = []
     for v in values:
-        setattr(a, axis, v)
+        if axis == 'branches':
+            # The synthesis axis: each arm names what it keeps, joined with
+            # '+', so the comparison is between architectures rather than
+            # between scalars. 'none' means no branches.
+            keep = {k for k in v.split('+') if k != 'none'}
+            unknown = keep - {'attn', 'plastic', 'aux', 'adamw'}
+            if unknown:
+                raise SystemExit(f"branches: unknown {sorted(unknown)}; "
+                                 "pick from attn, plastic, aux, adamw")
+            a.no_attn, a.no_plastic = 'attn' not in keep, 'plastic' not in keep
+            a.no_aux = 'aux' not in keep
+            a.optimizer = 'adamw' if 'adamw' in keep else 'muon'
+        else:
+            setattr(a, axis, None if (axis == 'quant' and v == 'none') else v)
         print(f"--- {axis}={v} ---")
         model = build(a, meta, verbose=False)
         tr, va = streams(a, meta)
         trainer = Trainer(model, lr=a.lr, warmup=a.warmup, total=a.steps,
                           weight_decay=a.weight_decay, window=a.window,
-                          device=torch.device(a.device))
+                          optimizer=a.optimizer, device=torch.device(a.device))
         t0 = time.perf_counter()
         trainer.run(tr, va, a.steps, log_every=max(a.steps // 4, 1), eval_every=0)
         ev = trainer.evaluate(va, 30)
@@ -194,9 +225,10 @@ def run_ablate(a, meta):
               f"{r['total']:,} params\n")
 
     print(f"{'=' * 72}")
-    print(f"{axis:>10} {'params':>10} {'val loss':>10} {'bpb':>8} {'vs first':>10} {'sec':>7}")
+    width = max(10, max(len(str(v)) for v, *_ in rows))
+    print(f"{axis:>{width}} {'params':>10} {'val loss':>10} {'bpb':>8} {'vs first':>10} {'sec':>7}")
     for v, p, loss, bpb, secs in rows:
-        print(f"{str(v):>10} {p:>10,} {loss:>10.4f} {bpb:>8.4f} "
+        print(f"{str(v):>{width}} {p:>10,} {loss:>10.4f} {bpb:>8.4f} "
               f"{loss - rows[0][2]:>+10.4f} {secs:>7.0f}")
     print(f"{'=' * 72}")
     return rows
@@ -210,7 +242,7 @@ def run_smoke(a, meta):
     model = build(a, meta)
     tr, va = streams(a, meta)
     trainer = Trainer(model, lr=a.lr, warmup=2, total=12, window=a.window,
-                      device=torch.device(a.device))
+                      optimizer=a.optimizer, device=torch.device(a.device))
 
     print("\n  trainable parameters:")
     for n, p in model.named_parameters():
@@ -244,13 +276,19 @@ def run_smoke(a, meta):
     loss = F.cross_entropy(logits.reshape(-1, meta['vocab_size']).float(), y.reshape(-1))
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     grads = torch.autograd.grad(loss, [p for _, p in named], allow_unused=True)
-    gated = {'self_logit', 'U', 'r_norm.weight'}
+    # Everything behind a zero-initialized output projection. Their gradient is
+    # exactly zero at step 0 by construction -- that zero is what makes each
+    # branch inert at init, so an ablation differs in one variable. They open
+    # once the tensor in front of them moves, which the next block checks.
+    gated = ({'self_logit', 'U', 'r_norm.weight', 'dec_u', 'dec_norm.weight'}
+             | {n for n, _ in named if n.startswith(('attn.', 'plastic.'))
+                and not n.endswith('o_proj.weight')})
     print("\n  gradient reaches:")
     for (n, _), g in zip(named, grads):
         norm = 0.0 if g is None else g.norm().item()
         note = ''
         if n in gated:
-            note = '   (gated shut at init, by design)'
+            note = '   (behind a zero-init projection, by design)'
         elif norm == 0:
             note = '   <-- UNREACHED'
         print(f"    {n:<28} |g| {norm:.3e}{note}")
@@ -326,6 +364,17 @@ def parse_args():
     g.add_argument('--no-unigram', action='store_true',
                    help="Leave the logit bias at zero — the arm that measures "
                         "what the unigram prior was worth.")
+    g.add_argument('--no-attn', action='store_true', help="Drop temporal attention.")
+    g.add_argument('--attn-heads', type=int, default=4)
+    g.add_argument('--attn-head-dim', type=int, default=16)
+    g.add_argument('--attn-window', type=int, default=128)
+    g.add_argument('--no-plastic', action='store_true', help="Drop delta-rule fast weights.")
+    g.add_argument('--plastic-dim', type=int, default=32)
+    g.add_argument('--no-aux', action='store_true', help="Drop the encoder and readout adapter.")
+    g.add_argument('--aux-rank', type=int, default=64)
+    g.add_argument('--quant', choices=('int8', 'int4', 'ternary'), default=None,
+                   help="QAT on the recurrent operators. int8 measured free; "
+                        "int4 costs +0.27 nats, ternary +0.48.")
 
     g = p.add_argument_group('training')
     g.add_argument('--steps', type=int, default=STEPS)
@@ -337,6 +386,9 @@ def parse_args():
                    help="Backward window in steps. The lever that makes a long "
                         "sequence trainable: a shared matrix's per-step Jacobian "
                         "sits above 1, so 0 (full backprop) is exponential.")
+    g.add_argument('--optimizer', choices=('muon', 'adamw'), default='muon',
+                   help="Muon measured -0.53 val nats against AdamW at equal "
+                        "parameters, seed and step count.")
     g.add_argument('--weight-decay', type=float, default=0.01)
     g.add_argument('--dropout', type=float, default=0.0)
     g.add_argument('--checkpoint', action='store_true',
@@ -355,7 +407,9 @@ def parse_args():
     g.add_argument('--eval-every', type=int, default=500)
     g.add_argument('--sample', action='store_true')
     g.add_argument('--ablate', default=None, metavar='AXIS=V1,V2',
-                   help="e.g. --ablate depth=0,4,8")
+                   help="e.g. --ablate depth=0,4,8, or --ablate "
+                        "branches=none+adamw,none,aux,attn,plastic,attn+plastic+aux "
+                        "to compare architectures (names join with '+')")
 
     a = p.parse_args()
     if a.mode == 'ablate' and not a.ablate:

@@ -22,9 +22,11 @@ from aleph.train.trainer import Trainer
 V, N = 512, 64
 
 
-def make(depth=4, **kw):
+def make(depth=4, nnz=16, code='random', tokens=None, **kw):
+    """A small core on CPU. Codebook kwargs are named; the rest go to the core."""
     torch.manual_seed(0)
-    return AlephCore(N, Codebook(V, N, nnz=16, **kw), depth=depth)
+    cb = Codebook(V, N, nnz=nnz, code=code, tokens=tokens)
+    return AlephCore(N, cb, depth=depth, **kw)
 
 
 class TestCodebook:
@@ -306,8 +308,13 @@ class TestMuon:
         m = make(depth=4)
         opt = MuonAdamW.from_model(m)
         muon = {id(p) for g in opt.param_groups if g['use_muon'] for p in g['params']}
-        assert {id(m.W), id(m.U), id(m.V)} == muon
-        for p in (m.b, m.norm.weight, m.codebook.bias, m.codebook.in_gain):
+        # Every operator goes to Muon, including the branches'.
+        for p in (m.W, m.U, m.V, m.dec_u, m.dec_v, m.attn.q_proj.weight,
+                  m.attn.o_proj.weight, m.plastic.k_temp.weight, m.plastic.o_proj.weight):
+            assert id(p) in muon
+        # Gains, biases and the per-synapse gate field do not.
+        for p in (m.b, m.norm.weight, m.codebook.bias, m.codebook.in_gain,
+                  m.plastic.beta, m.plastic.decay, m.attn.q_norm.weight):
             assert id(p) not in muon
 
     def test_step_preserves_the_zero_diagonal(self):
@@ -401,3 +408,181 @@ class TestTrainer:
         x, y = TokenStream(cache, 2, 8).next()
         _, h = Trainer(make()).train_step(torch.as_tensor(x), torch.as_tensor(y))
         assert not h.requires_grad
+
+
+class TestBranchInertness:
+    """Every optional branch must be inert at initialization.
+
+    This is what makes an ablation one variable: a model with a branch on and
+    one with it off must produce the identical loss at step 0, so any later
+    difference is the mechanism learning rather than a different starting point.
+    """
+
+    @pytest.mark.parametrize('kw', [{'attn': True}, {'plastic': True}, {'aux': True}])
+    def test_branch_changes_nothing_at_init(self, kw):
+        ids = torch.randint(0, V, (3, 12))
+        off = {'attn': False, 'plastic': False, 'aux': False}
+        base, _ = make(depth=4, **{**off})(ids)
+        with_branch, _ = make(depth=4, **{**off, **kw})(ids)
+        assert torch.allclose(base, with_branch, atol=1e-6)
+
+    def test_all_branches_on_is_also_inert(self):
+        ids = torch.randint(0, V, (3, 12))
+        off, _ = make(depth=4, attn=False, plastic=False, aux=False)(ids)
+        on, _ = make(depth=4)(ids)
+        assert torch.allclose(off, on, atol=1e-6)
+
+    def test_branches_contribute_after_training(self, cache):
+        """And once trained, each branch must actually be doing something."""
+        import torch.nn.functional as F
+        m = make(depth=4)
+        t = Trainer(m, lr=1e-2, warmup=1, total=20)
+        s = TokenStream(cache, 4, 16)
+        for _ in range(8):
+            x, y = s.next()
+            t.train_step(torch.as_tensor(x), torch.as_tensor(y))
+        assert m.attn.o_proj.weight.abs().max() > 0
+        assert m.plastic.o_proj.weight.abs().max() > 0
+        assert m.dec_v.abs().max() > 0
+        assert m.enc.weight.abs().max() > 0
+
+
+class TestAttention:
+    def test_cache_carries_across_calls(self):
+        m = make(depth=0, plastic=False, aux=False)
+        ids = torch.randint(0, V, (2, 8))
+        _, h = m(ids)
+        assert m.attn._pos == 8 and m.attn._k.shape[2] == 8
+        m(ids, state=h)
+        assert m.attn._pos == 16 and m.attn._k.shape[2] == 16
+
+    def test_fresh_state_resets_the_cache(self):
+        m = make(depth=0, plastic=False, aux=False)
+        ids = torch.randint(0, V, (2, 8))
+        m(ids)
+        m(ids)  # state=None: a new stream, so the history must not leak in
+        assert m.attn._pos == 8
+
+    def test_cache_truncates_to_window(self):
+        m = make(depth=0, plastic=False, aux=False, attn_window=6)
+        ids = torch.randint(0, V, (2, 10))
+        _, h = m(ids)
+        assert m.attn._k.shape[2] == 6
+        m(ids, state=h)
+        assert m.attn._k.shape[2] == 6
+
+    def test_cache_is_detached(self):
+        m = make(depth=0, plastic=False, aux=False)
+        m(torch.randint(0, V, (2, 8)))
+        assert not m.attn._k.requires_grad and not m.attn._v.requires_grad
+
+    def test_carry_makes_a_short_chunk_see_the_past(self):
+        """A chunked run and a whole-sequence run must agree, which is the
+        only reason splitting a sequence into short chunks is free."""
+        torch.manual_seed(0)
+        m = make(depth=0, plastic=False, aux=False).eval()
+        ids = torch.randint(0, V, (2, 16))
+        with torch.no_grad():
+            whole, _ = m(ids)
+            a, h = m(ids[:, :8])
+            b, _ = m(ids[:, 8:], state=h)
+        assert torch.allclose(whole, torch.cat([a, b], dim=1), atol=1e-4)
+
+    def test_batch_change_resets_rather_than_crashing(self):
+        m = make(depth=0, plastic=False, aux=False)
+        m(torch.randint(0, V, (4, 8)))
+        m(torch.randint(0, V, (2, 8)))  # must not try to concat (4,...) with (2,...)
+
+
+class TestPlasticity:
+    def test_trace_carries_and_is_detached(self):
+        m = make(depth=0, attn=False, aux=False)
+        ids = torch.randint(0, V, (2, 8))
+        _, h = m(ids)
+        assert m.plastic._S.shape == (2, m.plastic.dim, m.plastic.dim)
+        assert not m.plastic._S.requires_grad
+        trace = m.plastic._S.clone()
+        m(ids, state=h)
+        assert not torch.equal(m.plastic._S, trace)
+
+    def test_delta_rule_erases_what_it_retrieves(self):
+        """Write the same association twice: the second write must be smaller,
+        because the first one already satisfies it. That is the whole
+        difference between the delta rule and Hebbian accumulation."""
+        from aleph.core.plasticity import Plasticity
+        torch.manual_seed(0)
+        p = Plasticity(N, dim=8)
+        with torch.no_grad():
+            p.beta.fill_(4.0)   # wide open
+            p.decay.fill_(8.0)  # no forgetting
+        x = torch.randn(1, 1, N).repeat(1, 6, 1)  # the same state, six times
+        with torch.no_grad():
+            p(x, window=0)
+        # After repeated identical writes the trace must converge, not grow.
+        s1 = p._S.norm().item()
+        p.reset_cache()
+        with torch.no_grad():
+            p(x[:, :2], window=0)
+        s2 = p._S.norm().item()
+        assert s1 < s2 * 3, f"trace grew without bound: {s2} -> {s1}"
+
+    def test_state_per_stream_exceeds_the_vector_state(self):
+        """The point of the matrix: more memory than the state vector, for
+        parameters that do not scale with it."""
+        m = make(depth=0, attn=False, aux=False, plastic_dim=32)
+        assert m.plastic.dim ** 2 > m.n
+
+
+class TestQuantization:
+    @pytest.mark.parametrize('mode,levels', [('ternary', 3), ('int4', 15), ('int8', 255)])
+    def test_quantize_produces_the_promised_level_count(self, mode, levels):
+        from aleph.core.core import quantize_ste
+        torch.manual_seed(0)
+        w = torch.randn(4, 256)
+        q = quantize_ste(w, mode)
+        for row in q:
+            assert row.unique().numel() <= levels
+
+    def test_gradient_passes_straight_through(self):
+        from aleph.core.core import quantize_ste
+        w = torch.randn(4, 32, requires_grad=True)
+        quantize_ste(w, 'ternary').sum().backward()
+        assert torch.allclose(w.grad, torch.ones_like(w))
+
+    def test_none_is_exactly_the_identity(self):
+        from aleph.core.core import quantize_ste
+        w = torch.randn(4, 32)
+        assert quantize_ste(w, None) is w and quantize_ste(w, 'none') is w
+
+    def test_rejects_an_unknown_mode(self):
+        from aleph.core.core import quantize_ste
+        with pytest.raises(ValueError, match=r"quant must be"):
+            quantize_ste(torch.randn(2, 2), 'int3')
+
+    def test_qat_model_trains_and_keeps_the_diagonal(self, cache):
+        m = make(depth=4, quant='int8')
+        t = Trainer(m, lr=1e-2, warmup=1, total=10)
+        s = TokenStream(cache, 4, 16)
+        for _ in range(4):
+            x, y = s.next()
+            metrics, _ = t.train_step(torch.as_tensor(x), torch.as_tensor(y))
+        assert math.isfinite(metrics['loss'])
+        assert torch.equal(m.W.diagonal(), torch.zeros(N))
+
+
+class TestGeometryEquivalence:
+    """The measurement the default geometry rests on: a wide-short step and a
+    narrow-long one are the same computation, so choosing the fast one costs
+    nothing."""
+
+    def test_chunked_equals_whole_under_state_carry(self):
+        torch.manual_seed(0)
+        m = make(depth=4).eval()
+        ids = torch.randint(0, V, (2, 24))
+        with torch.no_grad():
+            whole, _ = m(ids)
+            parts, h = [], None
+            for i in range(0, 24, 8):
+                out, h = m(ids[:, i:i + 8], state=h)
+                parts.append(out)
+        assert torch.allclose(whole, torch.cat(parts, dim=1), atol=1e-4)

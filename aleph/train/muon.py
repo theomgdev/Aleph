@@ -127,7 +127,14 @@ class MuonAdamW(torch.optim.Optimizer):
         super().__init__(groups, {})
 
     def set_lr(self, lr, muon_scale=1.0):
-        """Set both halves from one schedule value."""
+        """Set both halves from one schedule value.
+
+        `muon_scale` is how much more step the Muon half takes, and it must be
+        passed on every call: this overwrites `lr`, so a `muon_lr` given at
+        construction does not survive the first schedule update. A probe that
+        set `muon_lr` and then called `set_lr(lr)` per step silently ran the
+        default ratio and produced an arm identical to its neighbour.
+        """
         for g in self.param_groups:
             g['lr'] = lr * (muon_scale if g['use_muon'] else 1.0)
 
@@ -149,11 +156,12 @@ class MuonAdamW(torch.optim.Optimizer):
                          if group['nesterov'] else buf)
 
                     update = orthogonalize(g)
-                    # The orthogonal update has unit singular values whatever
-                    # the matrix shape, so the step is rescaled by the shape to
-                    # keep its per-entry magnitude comparable across sizes --
-                    # the same role bias correction plays in Adam.
-                    scale = max(1.0, p.shape[0] / p.shape[1]) ** 0.5
+                    # Moonshot AI RMS-matching rule (Liu et al. 2025,
+                    # arXiv:2502.16982): an orthogonal A x B update has entry
+                    # RMS 1 / sqrt(max(A, B)), whereas AdamW's update RMS sits
+                    # near 0.2. Scaling by 0.2 * sqrt(max(A, B)) puts Muon on
+                    # AdamW's step scale across every width and aspect ratio.
+                    scale = 0.2 * (max(p.shape[0], p.shape[1]) ** 0.5)
                     if group['weight_decay']:
                         p.mul_(1 - group['lr'] * group['weight_decay'])
                     p.add_(update, alpha=-group['lr'] * scale)
@@ -179,10 +187,20 @@ class MuonAdamW(torch.optim.Optimizer):
 
     @classmethod
     def from_model(cls, model, **kw):
-        """Split an `AlephCore`'s parameters by the operator/modulation rule."""
+        """Split parameters by shape, with one exception.
+
+        Every 2D parameter here is an operator -- it maps one vector space to
+        another -- and orthogonalizing its update is what Muon is for. Gains,
+        biases and the state vector are 1D and belong to AdamW.
+
+        The exception is `Plasticity.beta`: it is 2D but it is not an operator,
+        it is a `D x D` field of independent sigmoid logits. Orthogonalizing it
+        would mix gates that have nothing to do with each other.
+        """
         muon, adamw = [], []
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            (muon if name in ('W', 'U', 'V') else adamw).append(p)
+            is_operator = p.ndim == 2 and not name.endswith('beta')
+            (muon if is_operator else adamw).append(p)
         return cls(muon, adamw, **kw)
