@@ -12,6 +12,7 @@ import sys
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from aleph.core.codebook import Codebook
@@ -617,7 +618,8 @@ class TestCheckpointIdentity:
             no_self_gain=False, no_attn=True, attn_heads=2, attn_kv_heads=1,
             attn_head_dim=8, attn_window=16,
             no_plastic=False, plastic_dim=8, no_aux=True, aux_rank=4,
-            aux_kernel=3, quant='int8')
+            aux_kernel=3, quant='int8', wait=0, ponder_max=4,
+            ponder_prior=0.5, ponder_eps=0.01)
         meta = {'vocab_size': V, 'path': 'x/y.bin'}
         arch = X.arch_of(a, meta)
         assert arch['attn'] is False and arch['aux'] is False
@@ -851,6 +853,134 @@ class TestWaitSteps:
         m = make(depth=4)
         with pytest.raises(ValueError, match='wait'):
             m(torch.randint(0, V, (1, 3)), wait=-2)
+
+
+class TestPonder:
+    """Adaptive halting: the allocation, which is what fixed `wait` lacked.
+
+    The mechanism is PonderNet's halting distribution over candidate states,
+    and three of its properties are load-bearing rather than incidental. The
+    distribution is normalized for *any* halting law, which is what makes
+    `ponder_max` a hard bound that needs no penalty and cannot run away. The
+    head is zero-initialized and draws no RNG, so a pondering model and a plain
+    one at the same seed share a core and `ponder_max` is an ablation with one
+    variable. And the exit is the expected state rather than a sampled one, so
+    gradient reaches the head from the language-model loss alone -- no
+    straight-through estimator and no reward signal anywhere.
+    """
+
+    def test_ponder_zero_is_inert_and_shares_the_core(self):
+        plain, pondering = make(depth=4), make(depth=4, ponder_max=4)
+        assert torch.equal(plain.W, pondering.W)
+        assert torch.equal(plain.U, pondering.U)
+        ids = torch.randint(0, V, (2, 8))
+        with torch.no_grad():
+            la, _ = plain(ids)
+            lb, _ = make(depth=4, ponder_max=0)(ids)
+        assert torch.equal(la, lb)
+
+    def test_costs_n_plus_one_parameters(self):
+        plain, pondering = make(depth=4), make(depth=4, ponder_max=8)
+        delta = (pondering.param_report()['total'] - plain.param_report()['total'])
+        assert delta == N + 1
+
+    @pytest.mark.parametrize('bias', [-20.0, -3.0, 0.0, 3.0, 20.0])
+    def test_exit_distribution_is_normalized_for_any_law(self, bias):
+        """The maximum is the support of a probability distribution, so it holds
+        by construction rather than by a rule. An adversarial head cannot make
+        the mass sum to anything but one, and cannot exceed `ponder_max`."""
+        m = make(depth=4, ponder_max=6)
+        with torch.no_grad():
+            m.ponder.bias.fill_(bias)
+            m.ponder.w.normal_(0, 3.0)
+            m.ponder.reset_stats()
+            h = torch.randn(4, N)
+            h = h / h.norm(dim=-1, keepdim=True) * N ** 0.5
+            m._ponder_steps(h, m.codebook.inject_wait(), m.W, m.U, m.V, None)
+        assert 0.0 <= m.ponder.mean_steps <= m.ponder.max_wait + 1e-5
+
+    def test_exit_stays_on_the_state_sphere(self):
+        """A mixture of unit vectors is shorter than its parts, so without the
+        rescale a token that hedges would hand the recurrence a smaller state
+        than one that commits -- a norm channel leaking 'this was hard' into
+        every downstream branch."""
+        m = make(depth=4, ponder_max=6)
+        with torch.no_grad():
+            m.ponder.w.normal_(0, 2.0)
+            h = torch.randn(5, N)
+            h = h / h.norm(dim=-1, keepdim=True) * N ** 0.5
+            out = m._ponder_steps(h, m.codebook.inject_wait(), m.W, m.U, m.V, None)
+        assert torch.allclose(out.norm(dim=-1), h.norm(dim=-1), rtol=1e-4)
+
+    def test_gradient_reaches_the_head_from_the_lm_loss_alone(self):
+        """No KL, no reward: averaging the state instead of sampling an exit is
+        what makes the head trainable by the same backward pass as `W`."""
+        m = make(depth=4, ponder_max=4)
+        ids = torch.randint(0, V, (2, 6))
+        logits, _ = m(ids)
+        F.cross_entropy(logits.reshape(-1, V),
+                        torch.randint(0, V, (12,))).backward()
+        assert m.ponder.w.grad is not None and m.ponder.w.grad.norm() > 0
+        assert m.ponder.bias.grad is not None
+        assert m.W.grad.norm() > 0
+
+    def test_kl_is_live_and_starts_near_the_prior(self):
+        m = make(depth=4, ponder_max=8, ponder_prior=0.5)
+        m(torch.randint(0, V, (2, 8)))
+        assert m.ponder.kl.requires_grad
+        # Zero-init head means a state-independent lambda at exactly `prior`,
+        # so the mean should land on the truncated geometric's, near 1/p - 1.
+        assert abs(m.ponder.mean_steps - 1.0) < 0.15
+
+    def test_one_token_one_logit_row(self):
+        m = make(depth=4, ponder_max=6)
+        with torch.no_grad():
+            logits, h = m(torch.randint(0, V, (3, 9)))
+        assert logits.shape == (3, 9, V)
+        assert h.shape == (3, m.n)
+
+    def test_chunked_and_stepwise_agree(self):
+        m = make(depth=4, ponder_max=4)
+        m.eval()
+        ids = torch.randint(0, V, (2, 10))
+        with torch.no_grad():
+            whole, _ = m(ids)
+            m.reset_caches()
+            outs, st = [], None
+            for t in range(ids.shape[1]):
+                o, st = m(ids[:, t:t + 1], state=st)
+                outs.append(o)
+        assert torch.allclose(whole, torch.cat(outs, dim=1), atol=1e-4)
+
+    def test_wait_and_ponder_are_mutually_exclusive(self):
+        with pytest.raises(ValueError, match='same mechanism'):
+            make(depth=4, wait=2, ponder_max=4)
+
+    def test_rejects_bad_configuration(self):
+        with pytest.raises(ValueError, match='ponder_max'):
+            make(depth=4, ponder_max=-1)
+        with pytest.raises(ValueError, match='prior'):
+            make(depth=4, ponder_max=4, ponder_prior=0.0)
+        with pytest.raises(ValueError, match='prior'):
+            make(depth=4, ponder_max=4, ponder_prior=1.0)
+
+    def test_trainer_adds_the_kl_only_to_what_is_differentiated(self, cache):
+        """The reported loss has to stay comparable to a non-pondering run, so
+        the regularizer may change the gradient but never the score."""
+        m = make(depth=4, ponder_max=4)
+        t = Trainer(m, lr=1e-3, warmup=1, total=4, ponder_beta=0.5)
+        s = TokenStream(cache, 2, 8)
+        x, y = s.next()
+        x = torch.as_tensor(x)
+        y = torch.as_tensor(y)
+        metrics, _ = t.train_step(x, y)
+        with torch.no_grad():
+            logits, _ = m(x)
+            ce = F.cross_entropy(logits.reshape(-1, V).float(), y.reshape(-1))
+        # Reported loss is a cross-entropy, not a cross-entropy plus a penalty:
+        # it moved only by the optimizer step taken between the two.
+        assert abs(metrics['loss'] - ce.item()) < 1.0
+        assert 'steps' in metrics and metrics['steps'] >= 0.0
 
 
 class TestCachePortability:

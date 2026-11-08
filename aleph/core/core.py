@@ -89,6 +89,7 @@ import torch.utils.checkpoint as checkpoint
 from .attention import TemporalAttention
 from .codebook import Codebook
 from .plasticity import Plasticity
+from .ponder import Ponder
 
 
 def quantize_ste(w, mode):
@@ -166,7 +167,16 @@ class AlephCore(nn.Module):
             readout. 0 disables them. Depth here is time, so this buys
             deliberation per token the way `depth` buys it per step -- but
             unlike `depth` it costs sequential launches, which is the expensive
-            axis in this loop.
+            axis in this loop. Measured to lose to the same seconds spent on
+            more steps, because it spends the maximum on every token.
+        ponder_max (int): Adaptive version of `wait`: up to this many extra
+            steps, allocated per token by a learned halting law for `N + 1`
+            parameters. 0 disables it and is exactly inert. Mutually exclusive
+            with `wait`, which is the same mechanism without the allocation.
+        ponder_prior (float): Halting rate of the geometric the KL pulls
+            toward, so roughly `1/prior - 1` mean extra steps. Default 0.5.
+        ponder_eps (float): Survival probability below which the ponder loop
+            exits early outside training. Default 0.01.
         dropout (float): Applied to the state after the activation. Default 0.
         gradient_checkpointing (bool): Recompute steps in the backward pass.
             Trades ~30% time for a step-count-independent memory profile.
@@ -177,6 +187,7 @@ class AlephCore(nn.Module):
                  self_gain=True, attn=True, attn_heads=4, attn_kv_heads=1,
                  attn_head_dim=16, attn_window=128, plastic=True, plastic_dim=32,
                  aux=True, aux_rank=64, aux_kernel=4, quant=None, wait=0,
+                 ponder_max=0, ponder_prior=0.5, ponder_eps=0.01,
                  dropout=0.0, gradient_checkpointing=False, device=None):
         super().__init__()
         if neurons < 2:
@@ -191,6 +202,12 @@ class AlephCore(nn.Module):
             raise ValueError(f"depth must be >= 0, got {depth}")
         if wait < 0:
             raise ValueError(f"wait must be >= 0, got {wait}")
+        if ponder_max < 0:
+            raise ValueError(f"ponder_max must be >= 0, got {ponder_max}")
+        if wait and ponder_max:
+            raise ValueError(
+                f"wait={wait} and ponder_max={ponder_max} are the same mechanism "
+                "with and without allocation; pick one")
 
         self.n = neurons
         self.depth = depth
@@ -272,6 +289,13 @@ class AlephCore(nn.Module):
             self.enc = self.dec_norm = None
             self.dec_u = self.dec_v = None
 
+        # Last, and drawing no RNG: the halting head is zero-initialized, so a
+        # pondering model and a plain one at the same seed share `W` exactly --
+        # the same reason attention is built after `_init_weights`. `ponder_max`
+        # is therefore an ablation with one variable.
+        self.ponder = Ponder(neurons, max_wait=ponder_max, prior=ponder_prior,
+                             eps=ponder_eps, device=device) if ponder_max else None
+
     # ------------------------------------------------------------------ #
 
     def reset_caches(self):
@@ -281,6 +305,62 @@ class AlephCore(nn.Module):
         if self.plastic is not None:
             self.plastic.reset_cache()
         self._enc_tail = None
+
+    def _ponder_steps(self, h, wcode, W, U, V, self_mult):
+        """Think for as long as this token is worth, and exit as the mixture.
+
+        The candidates are `h` and the states after 1..M extra applications of
+        the core. The head scores each as "halt here, given you have not
+        already", which turns into a distribution over candidates by the usual
+        survival product -- and because the last candidate takes all remaining
+        mass, the distribution is normalized for any halting law. The maximum is
+        the support of a probability distribution, so it needs no penalty to
+        hold and no rule to enforce.
+
+        What leaves is the expected candidate, rescaled to the expected norm.
+        The rescale matters: a mixture of unit vectors is shorter than its
+        parts, so without it a token that hedges across several candidates would
+        hand the recurrence a systematically smaller state than one that commits
+        -- a norm signal the model could read as "this was hard", and a
+        confound in every downstream branch. The target is the candidates' own
+        mean norm rather than `sqrt(N)`, so the learned norm gains are kept.
+        """
+        p = self.ponder
+        cands, logits = [h], [p.score(h)]
+        # Survival in log space: at M=20 the product underflows float32 around
+        # lambda=0.5, which would make the last candidate's mass a zero rather
+        # than the remainder.
+        log_surv = F.logsigmoid(-logits[0])
+
+        for _ in range(p.max_wait):
+            # Outside training a decode can stop as soon as the mass left is
+            # below tolerance. The final rescale absorbs the dropped tail, so
+            # this is an approximation to `eps` rather than a second behaviour.
+            if not self.training and log_surv.max().exp().item() < p.eps:
+                break
+            h = self._step(h, wcode, W, U, V, self_mult)
+            cands.append(h)
+            logits.append(p.score(h))
+            log_surv = log_surv + F.logsigmoid(-logits[-1])
+
+        # p_k = sigmoid(logit_k) * prod_{i<k} (1 - sigmoid(logit_i)), and the
+        # last candidate is forced so the mass sums to exactly one.
+        log_p, running = [], None
+        for i, lg in enumerate(logits):
+            halt = F.logsigmoid(lg)
+            log_p.append(halt if running is None else running + halt)
+            cont = F.logsigmoid(-lg)
+            running = cont if running is None else running + cont
+        log_p[-1] = running - F.logsigmoid(-logits[-1])
+
+        log_p = torch.stack(log_p, dim=-1)
+        p.observe(log_p)
+
+        weights = log_p.exp().unsqueeze(-1)
+        stack = torch.stack(cands, dim=1)
+        mixed = (weights * stack).sum(1)
+        target = (weights.squeeze(-1) * stack.norm(dim=-1)).sum(-1, keepdim=True)
+        return mixed * (target / mixed.norm(dim=-1, keepdim=True).clamp(min=1e-6))
 
     def _wait_steps(self, h, wcode, n, W, U, V, self_mult):
         """`n` extra applications of the core between two tokens.
@@ -398,7 +478,12 @@ class AlephCore(nn.Module):
         V = quantize_ste(self.V, self.quant) if self.V is not None else None
         self_mult = (self.self_gain * torch.sigmoid(self.self_logit)
                      if self.self_logit is not None else None)
-        wcode = self.codebook.inject_wait() if wait else None
+        pondering = self.ponder is not None
+        wcode = self.codebook.inject_wait() if (wait or pondering) else None
+        if pondering:
+            # One accounting period per call, so `kl` and `mean_steps` describe
+            # this chunk rather than everything since construction.
+            self.ponder.reset_stats()
 
         states = []
         for i in range(t):
@@ -411,7 +496,13 @@ class AlephCore(nn.Module):
                                           use_reentrant=False)
             else:
                 h = self._step(h, code, W, U, V, self_mult)
-            if wait:
+            if pondering:
+                # The halting law decides per token, so this is the same
+                # mechanism as `wait` with the allocation learned rather than
+                # fixed. Not checkpointed: the candidate stack has to stay live
+                # for the mixture, and recomputing it would run the loop twice.
+                h = self._ponder_steps(h, wcode, W, U, V, self_mult)
+            elif wait:
                 # Between reading this token and predicting the next one. Only
                 # the post-wait state is appended, so the branches below -- and
                 # the readout -- see one entry per token: the attention cache

@@ -139,7 +139,8 @@ class Codebook(nn.Module):
         # down, so a wait token inside the vocabulary would be trained toward
         # never being produced. It is injected, never predicted.
         self.register_buffer('wait_code',
-                             _sparse_ternary(1, width, nnz, seed ^ 0x5A17, device)[0])
+                             _sparse_ternary(1, width, nnz, seed ^ 0x5A17, device)[0],
+                             persistent=False)
 
         self.in_gain = nn.Parameter(torch.ones(width, device=device)) if in_gain else None
         self.out_scale = nn.Parameter(torch.ones((), device=device))

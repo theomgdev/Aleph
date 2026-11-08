@@ -50,7 +50,8 @@ WARMUP = 200
 ARCH_FIELDS = ('neurons', 'depth', 'rank', 'vocab', 'nnz', 'code', 'seed', 'cache',
                'self_gain', 'attn', 'attn_heads', 'attn_kv_heads',
                'attn_head_dim', 'attn_window', 'plastic', 'plastic_dim',
-               'aux', 'aux_rank', 'aux_kernel', 'quant', 'wait')
+               'aux', 'aux_rank', 'aux_kernel', 'quant', 'wait',
+               'ponder_max', 'ponder_prior', 'ponder_eps')
 
 
 def find_cache(data_dir, name=None):
@@ -93,6 +94,8 @@ def build(a, meta, verbose=True):
                       plastic=not a.no_plastic, plastic_dim=a.plastic_dim,
                       aux=not a.no_aux, aux_rank=a.aux_rank,
                       aux_kernel=a.aux_kernel, quant=a.quant, wait=a.wait,
+                      ponder_max=a.ponder_max, ponder_prior=a.ponder_prior,
+                      ponder_eps=a.ponder_eps,
                       gradient_checkpointing=a.checkpoint, device=dev).to(dev)
 
     if verbose:
@@ -124,7 +127,9 @@ def arch_of(a, meta):
             'attn_head_dim': a.attn_head_dim, 'attn_window': a.attn_window,
             'plastic': not a.no_plastic, 'plastic_dim': a.plastic_dim,
             'aux': not a.no_aux, 'aux_rank': a.aux_rank,
-            'aux_kernel': a.aux_kernel, 'quant': a.quant}
+            'aux_kernel': a.aux_kernel, 'quant': a.quant, 'wait': a.wait,
+            'ponder_max': a.ponder_max, 'ponder_prior': a.ponder_prior,
+            'ponder_eps': a.ponder_eps}
 
 
 def streams(a, meta):
@@ -138,6 +143,7 @@ def run_train(a, meta):
     trainer = Trainer(model, lr=a.lr, warmup=a.warmup, total=a.steps,
                       weight_decay=a.weight_decay, window=a.window,
                       optimizer=a.optimizer, reset_every=a.reset_every,
+                      ponder_beta=a.ponder_beta,
                       device=torch.device(a.device))
 
     ck = pathlib.Path(a.ckpt) / f"aleph_{a.tag}.pt"
@@ -532,6 +538,19 @@ def parse_args():
                    help="Extra core steps per token on a frozen wait code, no "
                         "readout. Buys deliberation in time; costs (wait+1)x "
                         "the sequential launches on a launch-bound loop.")
+    g.add_argument('--ponder-max', type=int, default=0,
+                   help="Adaptive `wait`: up to this many extra steps, "
+                        "allocated per token by a learned halting law for N+1 "
+                        "parameters. Mutually exclusive with --wait.")
+    g.add_argument('--ponder-prior', type=float, default=0.5,
+                   help="Halting rate the KL pulls toward, so roughly "
+                        "1/prior - 1 mean extra steps. Default 0.5.")
+    g.add_argument('--ponder-eps', type=float, default=0.01,
+                   help="Survival probability below which the ponder loop "
+                        "exits early outside training.")
+    g.add_argument('--ponder-beta', type=float, default=0.01,
+                   help="Weight on the halting KL. Without it the head spends "
+                        "the maximum on every token, which is fixed --wait.")
 
     g = p.add_argument_group('training')
     g.add_argument('--steps', type=int, default=STEPS)

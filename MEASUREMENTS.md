@@ -681,6 +681,55 @@ launch, where arithmetic is nearly free, while `wait` buys it in sequential
 launches, which is the one resource this loop does not have.
 
 So `wait` stays in the library as a measured axis (`--wait`, default 0, inert at
-0) and does not become a default. An adaptive halting head was not built: the
-fixed version has to win its time back before a learned controller is worth the
-parameters, and it does not.
+0) and does not become a default.
+
+### What about learning the allocation?
+
+The objection to the fixed table is fair: `wait=4` forces `the` and `and` to pay
+what a hard referent pays, which is the worst possible spending pattern. An
+adaptive halting law (`Ponder`, `N+1 = 513` parameters, PonderNet's survival
+distribution over candidates $h_0, \dots, h_M$, exiting as the norm-rescaled
+expectation $\sum_k p_k h_k$ with a KL toward a truncated geometric prior) was
+therefore built and measured on the same 800-step configuration:
+
+| arm | params | mean wait | val nats | bpb | vs `wait=0` |
+|---|---|---|---|---|---|
+| `wait=0` | 1,027,169 | 0.00 | 4.0688 | 1.4900 | — |
+| `fixed wait=1` | 1,027,169 | 1.00 | 3.9096 | 1.4317 | −0.159 |
+| `fixed wait=2` | 1,027,169 | 2.00 | 3.9319 | 1.4399 | −0.137 |
+| `ponder` (`prior=0.5`, $M=8$) | 1,027,682 | 2.63 | **3.7680** | **1.3799** | **−0.301** |
+| `ponder` (`prior=0.33`, $M=8$) | 1,027,682 | 4.11 | 3.8041 | 1.3931 | −0.265 |
+
+On tokens alone, `ponder` beats every fixed arm by another 0.14 nats for 513
+parameters — and even solves the backward-pass turn that hurt `wait=2` and
+`wait=4`, because $p_0 h_0$ keeps a direct skip path around the deeper steps.
+
+Then the diagnostic asks what the head actually learned (`tmp/probe_ponder_why.py`,
+65,536 validation tokens):
+
+* **Per-token difficulty varies by 8.83 nats** (p10 = 0.53, p90 = 9.36), so there
+  is plenty to allocate against.
+* **Per-token expected steps barely move**: under per-token KL (`mean=2.634`,
+  `sd=0.020` across batches, `0.32` per token; freezing `w=0` at the same mean
+  costs +0.131 nats) and under batch-marginal KL (`mean=1.687`, `sd=0.068`,
+  range `[1.21, 1.79]`; freezing `w=0` costs +0.033 nats).
+* **Why**: two structural reasons. First, 87.0% of the energy of $h$ sits in a
+  single constant cone (`|E[h]| = 19.09` out of `|h| = 20.46`, because `GELU`
+  lives in the positive orthant and `RMSNorm` does not center), so a linear
+  probe on $h$ spends most of its dynamic range on the constant offset. Second,
+  and deeper: $\sum_k p_k h_k$ is a **depth ensemble**. Averaging $h_0, h_1,
+  \dots, h_M$ with interior weights gives every token a multi-step residual
+  combination of higher effective rank than any single $h_k$ alone; committing
+  to one $k$ throws the other $M$ directions away.
+* **The early-exit test confirms it.** Truncating the tail at eval time when the
+  survival probability drops below `eps` ( trained at 200 steps, `val = 5.3866`
+  at `eps=0.01`): `eps=0.20` degrades to **5.8166** (+0.43 nats) and `eps=0.40`
+  to **6.7349** (+1.35 nats). Dropping the low-probability tail costs more than
+  the entire mechanism gained, because the model was using the tail as part of
+  its state representation rather than as an unused backup step.
+
+So differentiable halting by state expectation does not buy "stop early on easy
+tokens" — it buys a learned convex combination of $M{+}1$ sequential depths,
+which must all be run to produce the vector the readout was trained to read. Both
+`--wait` and `--ponder-max` remain in the library as inert axes (default 0,
+bit-identical at 0), and the main model stays at one step per token.
