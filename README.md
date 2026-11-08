@@ -72,6 +72,34 @@ random code at once; a rank-64 rotation separates those two jobs.
 All three are zero-initialized at their output, so switching one on changes
 nothing at step 0 and an ablation differs in exactly one variable.
 
+### Optionally, more than one step per token
+
+Depth is time here, so a token can be given more computation by applying `W`
+again with no token arriving — marked by a frozen code held outside `H`, so it
+is injected and never predicted. That placement is the mechanism, not a
+detail: a code the readout can emit is one the softmax is trained to suppress,
+because every supervised position pushes every non-target logit down. Kept out
+of the table, it needs no loss term and no reward to survive.
+
+```
+wait=k        k extra steps on every token
+ponder_max=M  up to M, allocated per token by a learned halting law (N+1 params)
+```
+
+The adaptive form follows PonderNet: `λ_k = σ(h_k·w/√N + b)` reads as "stop
+here, given you have not already", the chance of stopping at exactly `k` is
+`λ_k ∏_{i<k}(1−λ_i)`, and the last candidate absorbs the surviving mass. That
+sums to one for any weights, so the ceiling is the support of a distribution
+rather than a rule — it cannot be exceeded and needs no penalty to hold. The
+state leaves as the norm-rescaled expectation `Σ_k p_k h_k`, which is what makes
+the head trainable by the same backward pass as `W`, with no straight-through
+estimator anywhere. A KL toward a truncated geometric prices the budget.
+
+Both default to 0 and are bit-identical there. `ponder_max` is the better model
+per token (−0.301 nats at 800 matched steps) and the worse use of a second,
+because a mixture over candidates has to compute all of them — the honest
+accounting is in [`MEASUREMENTS.md`](MEASUREMENTS.md).
+
 ## What the measurements decided
 
 Every number here was taken on an RTX 3060 Ti, and several of them overturned a
@@ -132,6 +160,15 @@ int4 and +0.477 at ternary. That last figure independently reproduces the
 published +0.50 for sub-200M models, so it is recorded as a negative result:
 this architecture at this scale does not support 1.58-bit weights.
 
+**Extra steps per token buy loss, and lose the clock.** Applying `W` more than
+once per token is worth −0.162 nats fixed and −0.301 nats with a learned
+allocation, at matched optimizer steps and almost no parameters. Given the same
+*seconds* instead, plain training wins by 0.284–0.682 nats, and the gap widens
+with budget. The learned head is genuinely state-dependent — it beats a
+constant at the same mean cost — but what it learned is a depth *ensemble*
+rather than a stopping rule: truncating the low-probability tail at inference
+costs +0.43 nats, so every candidate step has to run. Both axes ship inert.
+
 Full tables, including the arms that lost, are in
 [`MEASUREMENTS.md`](MEASUREMENTS.md).
 
@@ -151,6 +188,9 @@ python tools/experiment.py --mode ablate --ablate depth=0,4,8,16
 python tools/experiment.py --mode ablate \
        --ablate branches=none+adamw,none,aux,attn,plastic,attn+plastic+aux
 python tools/experiment.py --mode ablate --ablate quant=none,int8,int4,ternary
+python tools/experiment.py --mode ablate --ablate wait=0,1,2,4
+python tools/experiment.py --mode ablate --ablate ponder_max=0,2,4,8
+python tools/experiment.py --mode depends --tag main         # what trained weights rely on
 python tools/experiment.py --mode eval --tag main --sample # re-score, no GPU time
 ```
 
@@ -221,13 +261,14 @@ aleph/core/codebook.py    frozen token codes; the V+N+1 interface
 aleph/core/core.py        the square recurrent core, branches, QAT
 aleph/core/attention.py   temporal attention over the state history
 aleph/core/plasticity.py  delta-rule fast weights at synaptic resolution
+aleph/core/ponder.py      learned halting law over extra core steps
 aleph/data/stream.py      tokenizers, token cache, B-cursor stream
 aleph/train/trainer.py    warmup/cosine, truncated BPTT, telemetry
 aleph/train/muon.py       Muon on the operators, AdamW on everything else
 tools/build_corpus.py     TinyStories -> uint16 token cache
-tools/experiment.py       train / smoke / ablate / eval
+tools/experiment.py       train / smoke / ablate / eval / depends
 tools/make_notebook.py    generates the Colab notebook
-tests/test_aleph.py       73 tests, CPU, ~15s
+tests/test_aleph.py       112 tests, CPU, ~30s
 ```
 
 `Research/` is gitignored: reference material, not library.

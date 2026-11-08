@@ -252,7 +252,42 @@ which is why the default is 8.
 **Warmup is not optional.** `depth=4` reached 0.0192 nats at lr 1e-3 and
 diverged at 3e-3, where `depth=0` tolerated both. The extra gradient path
 narrows the usable rate, so a depth comparison without warmup measures the
-schedule."""),
+schedule.
+
+### Thinking longer on a token
+
+`THINK` in the next cell is the one switch that changes what the model *is*
+rather than how it is trained. Depth here is time, so extra computation on a
+token is literally more applications of the same `W` with no token arriving —
+marked by a frozen code held outside `H`, so it is injected and never
+predicted. A code the readout cannot emit is one the softmax cannot be trained
+to suppress, which it otherwise would be: every supervised position pushes
+every non-target logit down.
+
+| `THINK` | what it does | measured at 800 matched steps |
+|---|---|---|
+| `'off'` | one step per token | 4.0688 nats — the reference run |
+| `'adaptive'` | learned halting law spends up to `PONDER_MAX` extra steps, `N+1` params | **3.7680 nats (−0.301)**, ~6× slower per step |
+| `'fixed'` | `WAIT` extra steps on every token, no allocation | 3.9096 nats (−0.159) at `WAIT=1` |
+
+Leave it `'off'` to reproduce the 0.9875 bpb record. Two things are worth
+knowing before switching it on, because both are load-bearing and neither is
+obvious:
+
+**The maximum is a probability, not a rule.** The halting law reads
+`λ_k = σ(h_k·w/√N + b)` as "stop here, given you have not already", so the
+chance of stopping at exactly `k` is `λ_k ∏_{i<k}(1-λ_i)` and the last
+candidate absorbs whatever survives. That sums to one for *any* weights, so
+`PONDER_MAX` cannot be exceeded and needs no penalty to hold it.
+
+**It buys loss per token, not per second.** The exit is the expected state
+`Σ_k p_k h_k`, which is a mixture rather than a choice — so every candidate step
+still has to run to produce the vector the readout reads. Truncating the
+low-probability tail at inference costs +0.43 nats, which says the model is
+using the tail as part of its representation, not keeping it as an unused
+backup. So `'adaptive'` is the better model at a fixed token budget and the
+worse use of a fixed hour; `MEASUREMENTS.md` carries the full table including
+the wall-clock arms where it loses."""),
     code("""
 import torch
 free = torch.cuda.get_device_properties(0).total_memory / 2**30 if torch.cuda.is_available() else 0
@@ -267,11 +302,42 @@ CFG = dict(
     lr      = 1e-3,
     warmup  = 300,
 )
+
+# ---- extra core steps per token ------------------------------------------
+# Depth here is time, so "think longer on this token" is more applications of
+# the same W with no token arriving, on a frozen code kept outside the readout.
+#
+#   'off'      one step per token. The 0.9875 bpb reference run.
+#   'adaptive' a learned halting law allocates up to ponder_max extra steps
+#              (N+1 params). Best loss measured: -0.301 nats against 'off' at
+#              800 matched steps -- and 6x slower per step, because the exit is
+#              a mixture over candidates so every step still runs.
+#   'fixed'    the same extra steps on every token, no allocation. Measured
+#              worse than 'adaptive' and worse than spending the seconds on
+#              more steps; kept because it is the control that says so.
+#
+# Honest summary: 'adaptive' buys loss per *token*, not per *second*. Use it to
+# study the mechanism or when data-bound; leave it off to reproduce the record.
+THINK       = 'off'        # 'off' | 'adaptive' | 'fixed'
+PONDER_MAX  = 4            # ceiling on extra steps (adaptive); hard, by construction
+PONDER_PRIOR= 0.5          # halting rate priced by the KL: ~1/p - 1 mean steps
+WAIT        = 2            # extra steps per token when THINK == 'fixed'
+
+think_args = {
+    'off':      [],
+    'adaptive': ['--ponder-max', str(PONDER_MAX), '--ponder-prior', str(PONDER_PRIOR)],
+    'fixed':    ['--wait', str(WAIT)],
+}[THINK]
+TAG = {'off': 'main', 'adaptive': 'ponder', 'fixed': 'wait'}[THINK]
+
 print(f"{free:.0f} GiB -> batch {CFG['batch']}")
 print(f"budget: {CFG['steps'] * CFG['batch'] * CFG['seq'] / 1e6:.0f}M tokens"
       f"  ({CFG['steps'] * CFG['batch'] * CFG['seq'] / meta['train_tokens']:.1f} epochs)")
+print(f"thinking: {THINK}{'  ' + ' '.join(think_args) if think_args else ''}  -> tag '{TAG}'")
 # Epochs is the number that tells data starvation from over-parameterization:
 # a corpus crossed dozens of times is starved, not too large a model.
+# The tag follows the mode, so switching THINK cannot resume into a checkpoint
+# that was trained under a different one.
 """),
 
     md("""The log line carries what distinguishes this architecture's failure
@@ -287,7 +353,7 @@ args = [sys.executable, "-u", "tools/experiment.py", "--mode", "train",
         "--window", str(CFG['window']),
         "--steps", str(CFG['steps']), "--lr", str(CFG['lr']),
         "--warmup", str(CFG['warmup']), "--ckpt", CKPT_DIR,
-        "--tag", "main", "--sample", "--resume"]
+        "--tag", TAG, "--sample", "--resume"] + think_args
 print(" ".join(args), "\\n")
 
 # Streamed rather than captured: a multi-hour cell that prints nothing is
@@ -381,6 +447,41 @@ r = subprocess.run([sys.executable, "-u", "tools/experiment.py", "--mode", "abla
 print(r.stdout[-3500:])
 """),
 
+    md("""### Extra steps per token, as an ablation
+
+The `wait` axis measures the fixed schedule against no extra steps at all, at
+matched optimizer steps. It is the control for `THINK='adaptive'`: if a learned
+allocation is worth its 513 parameters, it has to beat the best constant, and
+the only way to know the best constant is to measure it.
+
+Each arm is ~3 minutes on a T4, and `wait=4` is the interesting one — it scores
+*worse* than `wait=2`, because `wait=k` multiplies the backward length by `k+1`
+and the per-step Jacobian sits above 1 (`|g|` hit 722.99 against 7.93 at
+`wait=1`). The turn is the backward pass, not the capacity."""),
+    code("""
+r = subprocess.run([sys.executable, "-u", "tools/experiment.py", "--mode", "ablate",
+                    "--ablate", "wait=0,1,2,4", "--steps", "800",
+                    "--batch", "256", "--seq", "64"],
+                   capture_output=True, text=True)
+print(r.stdout[-3000:] or r.stderr[-2000:])
+"""),
+
+    md("""And the adaptive arm against it, at matched steps. The `wait` column
+in the log is the mean extra steps the halting law chose — watch it move while
+the cross-entropy bids against the KL that prices it. The ceiling is the
+support of a distribution, so no arm here can exceed `ponder-max` however the
+head is weighted."""),
+    code("""
+r = subprocess.run([sys.executable, "-u", "tools/experiment.py", "--mode", "ablate",
+                    "--ablate", "ponder_max=0,2,4,8", "--steps", "800",
+                    "--batch", "256", "--seq", "64"],
+                   capture_output=True, text=True)
+print(r.stdout[-3000:] or r.stderr[-2000:])
+# Mind the clock column: ponder_max=8 runs every candidate step to form the
+# mixture it exits as, so it is ~6x slower per optimizer step than ponder_max=0
+# while scoring better per token. Both halves of that are the finding.
+"""),
+
     md("""### Quantization
 
 QAT on the recurrent operators, measured rather than assumed. The same matrix
@@ -430,7 +531,7 @@ uses every token it is given. Attention saturates at a cache of 32. The two are
 reading different timescales, which is why they stack."""),
     code("""
 r = subprocess.run([sys.executable, "-u", "tools/experiment.py", "--mode", "depends",
-                    "--ckpt", CKPT_DIR, "--tag", "main"],
+                    "--ckpt", CKPT_DIR, "--tag", TAG],
                    capture_output=True, text=True)
 print(r.stdout[-3000:] or r.stderr[-2000:])
 """),
@@ -441,7 +542,7 @@ Generation is the only check that reads as language rather than as a number.
 A model can score well and produce nothing: read the samples."""),
     code("""
 r = subprocess.run([sys.executable, "-u", "tools/experiment.py", "--mode", "eval",
-                    "--ckpt", CKPT_DIR, "--tag", "main", "--sample"],
+                    "--ckpt", CKPT_DIR, "--tag", TAG, "--sample"],
                    capture_output=True, text=True)
 print(r.stdout[-4000:])
 """),
