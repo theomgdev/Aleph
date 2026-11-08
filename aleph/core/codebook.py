@@ -132,6 +132,16 @@ class Codebook(nn.Module):
         # by accident.
         self.register_buffer('H', table)
 
+        # The wait code: one more row, from a disjoint seed, kept out of `H` so
+        # it is not in the readout's span at all. A token the softmax cannot
+        # emit cannot be suppressed by the softmax either -- at every supervised
+        # position the gradient of -log p(target) pushes every non-target logit
+        # down, so a wait token inside the vocabulary would be trained toward
+        # never being produced. It is injected, never predicted.
+        self.register_buffer('wait_code',
+                             _sparse_ternary(1, width, nnz, seed ^ 0x5A17, device)[0],
+                             persistent=False)
+
         self.in_gain = nn.Parameter(torch.ones(width, device=device)) if in_gain else None
         self.out_scale = nn.Parameter(torch.ones((), device=device))
         self.bias = nn.Parameter(torch.zeros(vocab, device=device)) if logit_bias else None
@@ -166,6 +176,19 @@ class Codebook(nn.Module):
         if self.in_gain is not None:
             vec = vec * self.in_gain
         return vec * (ids >= 0).unsqueeze(-1).to(vec.dtype)
+
+    def inject_wait(self):
+        """The wait code, read through the same gain as any injected token.
+
+        Shaped `(N,)` and broadcast by the caller. Read through `in_gain` so a
+        wait step arrives on the same directions, at the same scale, as a token
+        -- the core gets one more application of `W` with a marker on the input,
+        not a differently-scaled perturbation it has to learn to tolerate.
+        """
+        vec = self.wait_code
+        if self.in_gain is not None:
+            vec = vec * self.in_gain
+        return vec
 
     def logits(self, h):
         """Scores over the vocabulary for state `h`, shaped `(..., N) -> (..., V)`."""

@@ -229,7 +229,20 @@ class TokenStream:
         return {'cursor': self.cursor.tolist(), 'epoch_tokens': int(self.epoch_tokens)}
 
     def load(self, state):
-        self.cursor = np.asarray(state['cursor'], dtype=np.int64)
+        """Restore a saved cursor vector.
+
+        One cursor per batch row, so a resume at a different `--batch` than the
+        run was saved at has nothing coherent to restore -- it would read past
+        the end of the vector mid-step. Said here rather than as an `IndexError`
+        from the next `next()`.
+        """
+        cursor = np.asarray(state['cursor'], dtype=np.int64)
+        if cursor.shape != self.cursor.shape:
+            raise ValueError(
+                f"saved stream has {cursor.shape[0]} cursors but this stream has "
+                f"{self.cursor.shape[0]}: resume with the batch size the "
+                f"checkpoint was trained at, or drop --resume")
+        self.cursor = cursor
         self.epoch_tokens = state['epoch_tokens']
 
     @property

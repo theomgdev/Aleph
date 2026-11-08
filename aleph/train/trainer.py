@@ -78,16 +78,22 @@ class Trainer:
             of training positions while being 100% of generation's first token
             -- measured 11.54 nats at position 0 against 2.74 warm, and 38
             tokens to recover. The model has to practise beginning.
+        ponder_beta (float): Weight on the halting KL when the model ponders.
+            Nothing in a cross-entropy prefers a short ponder and a mixture of
+            states is free capacity, so without this the head spends the
+            maximum on every token -- fixed `wait` reached by gradient descent.
+            Ignored when the model has no halting head.
     """
 
     def __init__(self, model, lr=1e-3, warmup=200, total=None, min_lr_frac=0.1,
                  weight_decay=0.01, clip=1.0, window=32, device=None,
-                 optimizer='muon', reset_every=16):
+                 optimizer='muon', reset_every=16, ponder_beta=0.01):
         self.model = model
         self.device = device or next(model.parameters()).device
         self.lr, self.warmup, self.total = lr, warmup, total
         self.min_lr_frac, self.clip, self.window = min_lr_frac, clip, window
         self.reset_every = reset_every
+        self.ponder_beta = ponder_beta
         self.step_count = 0
 
         if optimizer == 'muon':
@@ -137,6 +143,16 @@ class Trainer:
         # in TF32, which is also the more precise of the two.
         logits, h = self.model(x, state=state, window=self.window)
         loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]).float(), y.reshape(-1))
+        ce = loss.item()
+
+        # The KL is the only term that prices time: cross-entropy is happy to
+        # spend the maximum, so the reported loss stays the cross-entropy and
+        # the regularizer is added only to what is differentiated.
+        ponder = getattr(self.model, 'ponder', None)
+        steps = 0.0
+        if ponder is not None and ponder.kl is not None:
+            loss = loss + self.ponder_beta * ponder.kl
+            steps = ponder.mean_steps
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -148,8 +164,8 @@ class Trainer:
         self.step_count += 1
 
         return {
-            'loss': loss.item(), 'lr': lr, 'gnorm': gnorm.item(),
-            'hnorm': h.detach().norm(dim=-1).mean().item(),
+            'loss': ce, 'lr': lr, 'gnorm': gnorm.item(),
+            'hnorm': h.detach().norm(dim=-1).mean().item(), 'steps': steps,
         }, h.detach()
 
     @torch.no_grad()
@@ -183,9 +199,11 @@ class Trainer:
             self.total = steps
         state, best, t0 = None, float('inf'), time.perf_counter()
         window, tokens = [], 0
+        ponders = getattr(self.model, 'ponder', None) is not None
 
         header = (f"{'step':>6} {'loss':>7} {'bpb':>6} {'lr':>9} {'|g|':>6} "
-                  f"{'clip%':>6} {'|h|':>6} {'ep':>5} {'tok/s':>8}")
+                  f"{'clip%':>6} {'|h|':>6}" + (f" {'wait':>5}" if ponders else '')
+                  + f" {'ep':>5} {'tok/s':>8}")
         print(header)
         print('-' * len(header))
 
@@ -205,10 +223,12 @@ class Trainer:
             if (step + 1) % log_every == 0:
                 avg = sum(w['loss'] for w in window) / len(window)
                 bpb = avg / math.log(2) / train_stream.meta['bytes_per_token']
+                wait_col = (f" {sum(w['steps'] for w in window) / len(window):>5.2f}"
+                            if ponders else '')
                 print(f"{step + 1:>6} {avg:>7.4f} {bpb:>6.3f} {m['lr']:>9.2e} "
                       f"{sum(w['gnorm'] for w in window) / len(window):>6.2f} "
                       f"{self.since_log / len(window) * 100:>5.0f}% "
-                      f"{m['hnorm']:>6.2f} {train_stream.epochs:>5.2f} "
+                      f"{m['hnorm']:>6.2f}{wait_col} {train_stream.epochs:>5.2f} "
                       f"{tokens / (time.perf_counter() - t0):>8,.0f}", flush=True)
                 window = []
                 self.since_log = 0

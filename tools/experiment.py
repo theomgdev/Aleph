@@ -50,7 +50,8 @@ WARMUP = 200
 ARCH_FIELDS = ('neurons', 'depth', 'rank', 'vocab', 'nnz', 'code', 'seed', 'cache',
                'self_gain', 'attn', 'attn_heads', 'attn_kv_heads',
                'attn_head_dim', 'attn_window', 'plastic', 'plastic_dim',
-               'aux', 'aux_rank', 'aux_kernel', 'quant')
+               'aux', 'aux_rank', 'aux_kernel', 'quant', 'wait',
+               'ponder_max', 'ponder_prior', 'ponder_eps')
 
 
 def find_cache(data_dir, name=None):
@@ -92,7 +93,9 @@ def build(a, meta, verbose=True):
                       attn_head_dim=a.attn_head_dim, attn_window=a.attn_window,
                       plastic=not a.no_plastic, plastic_dim=a.plastic_dim,
                       aux=not a.no_aux, aux_rank=a.aux_rank,
-                      aux_kernel=a.aux_kernel, quant=a.quant,
+                      aux_kernel=a.aux_kernel, quant=a.quant, wait=a.wait,
+                      ponder_max=a.ponder_max, ponder_prior=a.ponder_prior,
+                      ponder_eps=a.ponder_eps,
                       gradient_checkpointing=a.checkpoint, device=dev).to(dev)
 
     if verbose:
@@ -103,7 +106,8 @@ def build(a, meta, verbose=True):
                                     ('aux', model.enc is not None)) if on]
         print(f"  N={a.neurons} depth={a.depth} rank={model.rank} V={meta['vocab_size']}")
         print(f"  branches: {', '.join(branches) or 'none'}"
-              f"{'  quant=' + a.quant if a.quant else ''}")
+              f"{'  quant=' + a.quant if a.quant else ''}"
+              f"{f'  wait={a.wait}' if a.wait else ''}")
         print(f"  trainable {r['total']:,}  = core {r['core']:,} + refine {r['refine']:,}"
               f" + interface {r['interface']:,} + mod {r['modulation']:,}")
         print(f"  interface vs a learned embed+head: {r['interface']:,} against "
@@ -123,7 +127,9 @@ def arch_of(a, meta):
             'attn_head_dim': a.attn_head_dim, 'attn_window': a.attn_window,
             'plastic': not a.no_plastic, 'plastic_dim': a.plastic_dim,
             'aux': not a.no_aux, 'aux_rank': a.aux_rank,
-            'aux_kernel': a.aux_kernel, 'quant': a.quant}
+            'aux_kernel': a.aux_kernel, 'quant': a.quant, 'wait': a.wait,
+            'ponder_max': a.ponder_max, 'ponder_prior': a.ponder_prior,
+            'ponder_eps': a.ponder_eps}
 
 
 def streams(a, meta):
@@ -137,6 +143,7 @@ def run_train(a, meta):
     trainer = Trainer(model, lr=a.lr, warmup=a.warmup, total=a.steps,
                       weight_decay=a.weight_decay, window=a.window,
                       optimizer=a.optimizer, reset_every=a.reset_every,
+                      ponder_beta=a.ponder_beta,
                       device=torch.device(a.device))
 
     ck = pathlib.Path(a.ckpt) / f"aleph_{a.tag}.pt"
@@ -149,9 +156,15 @@ def run_train(a, meta):
         # weights_only=True: the payload is tensors, dicts and scalars only, so
         # nothing here needs arbitrary unpickling.
         blob = torch.load(ck, map_location=a.device, weights_only=True)
-        saved = {k: blob['arch'][k] for k in ARCH_FIELDS}
-        if saved != arch_of(a, meta):
-            raise SystemExit(f"checkpoint architecture differs:\n  saved {saved}\n  now   {arch_of(a, meta)}")
+        # A checkpoint written before a field existed does not carry it, and
+        # `restore_arch` leaves those at the CLI default. Compare only what the
+        # checkpoint actually claims, or adding an inert axis would make every
+        # older checkpoint unresumable.
+        now = arch_of(a, meta)
+        saved = {k: blob['arch'][k] for k in ARCH_FIELDS if k in blob['arch']}
+        if saved != {k: now[k] for k in saved}:
+            differing = {k: (v, now[k]) for k, v in saved.items() if v != now[k]}
+            raise SystemExit(f"checkpoint architecture differs (saved, now): {differing}")
         model.load_state_dict(blob['model'])
         trainer.opt.load_state_dict(blob['opt'])
         trainer.step_count = start = blob['step']
@@ -527,6 +540,23 @@ def parse_args():
     g.add_argument('--quant', choices=('int8', 'int4', 'ternary'), default=None,
                    help="QAT on the recurrent operators. int8 measured free; "
                         "int4 costs +0.27 nats, ternary +0.48.")
+    g.add_argument('--wait', type=int, default=0,
+                   help="Extra core steps per token on a frozen wait code, no "
+                        "readout. Buys deliberation in time; costs (wait+1)x "
+                        "the sequential launches on a launch-bound loop.")
+    g.add_argument('--ponder-max', type=int, default=0,
+                   help="Adaptive `wait`: up to this many extra steps, "
+                        "allocated per token by a learned halting law for N+1 "
+                        "parameters. Mutually exclusive with --wait.")
+    g.add_argument('--ponder-prior', type=float, default=0.5,
+                   help="Halting rate the KL pulls toward, so roughly "
+                        "1/prior - 1 mean extra steps. Default 0.5.")
+    g.add_argument('--ponder-eps', type=float, default=0.01,
+                   help="Survival probability below which the ponder loop "
+                        "exits early outside training.")
+    g.add_argument('--ponder-beta', type=float, default=0.01,
+                   help="Weight on the halting KL. Without it the head spends "
+                        "the maximum on every token, which is fixed --wait.")
 
     g = p.add_argument_group('training')
     g.add_argument('--steps', type=int, default=STEPS)
