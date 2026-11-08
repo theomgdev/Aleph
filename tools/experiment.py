@@ -50,7 +50,7 @@ WARMUP = 200
 ARCH_FIELDS = ('neurons', 'depth', 'rank', 'vocab', 'nnz', 'code', 'seed', 'cache',
                'self_gain', 'attn', 'attn_heads', 'attn_kv_heads',
                'attn_head_dim', 'attn_window', 'plastic', 'plastic_dim',
-               'aux', 'aux_rank', 'aux_kernel', 'quant')
+               'aux', 'aux_rank', 'aux_kernel', 'quant', 'wait')
 
 
 def find_cache(data_dir, name=None):
@@ -92,7 +92,7 @@ def build(a, meta, verbose=True):
                       attn_head_dim=a.attn_head_dim, attn_window=a.attn_window,
                       plastic=not a.no_plastic, plastic_dim=a.plastic_dim,
                       aux=not a.no_aux, aux_rank=a.aux_rank,
-                      aux_kernel=a.aux_kernel, quant=a.quant,
+                      aux_kernel=a.aux_kernel, quant=a.quant, wait=a.wait,
                       gradient_checkpointing=a.checkpoint, device=dev).to(dev)
 
     if verbose:
@@ -103,7 +103,8 @@ def build(a, meta, verbose=True):
                                     ('aux', model.enc is not None)) if on]
         print(f"  N={a.neurons} depth={a.depth} rank={model.rank} V={meta['vocab_size']}")
         print(f"  branches: {', '.join(branches) or 'none'}"
-              f"{'  quant=' + a.quant if a.quant else ''}")
+              f"{'  quant=' + a.quant if a.quant else ''}"
+              f"{f'  wait={a.wait}' if a.wait else ''}")
         print(f"  trainable {r['total']:,}  = core {r['core']:,} + refine {r['refine']:,}"
               f" + interface {r['interface']:,} + mod {r['modulation']:,}")
         print(f"  interface vs a learned embed+head: {r['interface']:,} against "
@@ -527,6 +528,10 @@ def parse_args():
     g.add_argument('--quant', choices=('int8', 'int4', 'ternary'), default=None,
                    help="QAT on the recurrent operators. int8 measured free; "
                         "int4 costs +0.27 nats, ternary +0.48.")
+    g.add_argument('--wait', type=int, default=0,
+                   help="Extra core steps per token on a frozen wait code, no "
+                        "readout. Buys deliberation in time; costs (wait+1)x "
+                        "the sequential launches on a launch-bound loop.")
 
     g = p.add_argument_group('training')
     g.add_argument('--steps', type=int, default=STEPS)

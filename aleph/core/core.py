@@ -162,6 +162,11 @@ class AlephCore(nn.Module):
         quant (str, optional): `'int8'`, `'int4'` or `'ternary'` QAT on the
             recurrent operators. Default None. int8 measured free; see
             `quantize_ste`.
+        wait (int): Extra core steps per token, on a frozen wait code, with no
+            readout. 0 disables them. Depth here is time, so this buys
+            deliberation per token the way `depth` buys it per step -- but
+            unlike `depth` it costs sequential launches, which is the expensive
+            axis in this loop.
         dropout (float): Applied to the state after the activation. Default 0.
         gradient_checkpointing (bool): Recompute steps in the backward pass.
             Trades ~30% time for a step-count-independent memory profile.
@@ -171,8 +176,8 @@ class AlephCore(nn.Module):
     def __init__(self, neurons, codebook, depth=4, rank=None, activation='gelu',
                  self_gain=True, attn=True, attn_heads=4, attn_kv_heads=1,
                  attn_head_dim=16, attn_window=128, plastic=True, plastic_dim=32,
-                 aux=True, aux_rank=64, aux_kernel=4, quant=None, dropout=0.0,
-                 gradient_checkpointing=False, device=None):
+                 aux=True, aux_rank=64, aux_kernel=4, quant=None, wait=0,
+                 dropout=0.0, gradient_checkpointing=False, device=None):
         super().__init__()
         if neurons < 2:
             raise ValueError(f"neurons must be >= 2, got {neurons}")
@@ -184,9 +189,12 @@ class AlephCore(nn.Module):
                 "codes are read in the state's own space")
         if depth < 0:
             raise ValueError(f"depth must be >= 0, got {depth}")
+        if wait < 0:
+            raise ValueError(f"wait must be >= 0, got {wait}")
 
         self.n = neurons
         self.depth = depth
+        self.wait = wait
         self.rank = rank if rank is not None else max(4, neurons // 8)
         self.codebook = codebook
         self.gradient_checkpointing = gradient_checkpointing
@@ -274,6 +282,25 @@ class AlephCore(nn.Module):
             self.plastic.reset_cache()
         self._enc_tail = None
 
+    def _wait_steps(self, h, wcode, n, W, U, V, self_mult):
+        """`n` extra applications of the core between two tokens.
+
+        Depth here is time, so an extra step is literally one more application
+        of `W` -- the same operator, on a state carrying the same context, with
+        a marker on the input saying no token arrived. A transformer buying the
+        same deliberation has to push a pause token through every layer; this
+        architecture already is the loop, so the only cost is launches.
+
+        The marker matters: with a zero input the step is `h @ W + b`, which is
+        the same map the core applies when a token *is* absent at a padded
+        position. A distinct frozen code lets the core tell "still thinking"
+        from "nothing here", and it arrives through `in_gain` at a token's
+        scale so the state stays in the regime the recurrence was trained on.
+        """
+        for _ in range(n):
+            h = self._step(h, wcode, W, U, V, self_mult)
+        return h
+
     def _encode(self, codes):
         """Add local n-gram context to the injected codes, causally.
 
@@ -316,7 +343,7 @@ class AlephCore(nn.Module):
             out = out + self.act(self.r_norm(out) @ U) @ V
         return self.norm(self.drop(out))
 
-    def forward(self, ids, state=None, return_states=True, window=0):
+    def forward(self, ids, state=None, return_states=True, window=0, wait=None):
         """Run the core over token ids `(B, T)`.
 
         Returns `(logits, final_state)` where logits are `(B, T, V)` -- the
@@ -332,12 +359,19 @@ class AlephCore(nn.Module):
         exponentially in the backward length (measured 289x per doubling past
         128 steps). Every position is still predicted and still supervised --
         only the gradient's reach is cut, not the forward pass's.
+
+        `wait` overrides `self.wait` for this call: that many extra core steps
+        per token, on the frozen wait code, with no readout. One token still
+        produces exactly one logit row, so nothing downstream changes shape.
         """
         if ids.ndim != 2:
             raise ValueError(f"ids must be (B, T), got shape {tuple(ids.shape)}")
         if window < 0:
             raise ValueError(f"window must be >= 0, got {window}")
         b, t = ids.shape
+        wait = self.wait if wait is None else wait
+        if wait < 0:
+            raise ValueError(f"wait must be >= 0, got {wait}")
 
         if state is None:
             # A fresh state means a fresh stream: the branch caches belong to
@@ -364,6 +398,7 @@ class AlephCore(nn.Module):
         V = quantize_ste(self.V, self.quant) if self.V is not None else None
         self_mult = (self.self_gain * torch.sigmoid(self.self_logit)
                      if self.self_logit is not None else None)
+        wcode = self.codebook.inject_wait() if wait else None
 
         states = []
         for i in range(t):
@@ -376,6 +411,17 @@ class AlephCore(nn.Module):
                                           use_reentrant=False)
             else:
                 h = self._step(h, code, W, U, V, self_mult)
+            if wait:
+                # Between reading this token and predicting the next one. Only
+                # the post-wait state is appended, so the branches below -- and
+                # the readout -- see one entry per token: the attention cache
+                # and the plasticity trace keep their horizons in tokens rather
+                # than having them divided by the wait count.
+                if self.gradient_checkpointing and self.training:
+                    h = checkpoint.checkpoint(self._wait_steps, h, wcode, wait,
+                                              W, U, V, self_mult, use_reentrant=False)
+                else:
+                    h = self._wait_steps(h, wcode, wait, W, U, V, self_mult)
             states.append(h)
 
         h_seq = torch.stack(states, dim=1)
@@ -393,11 +439,18 @@ class AlephCore(nn.Module):
         return self.codebook.logits(h_seq), h
 
     @torch.no_grad()
-    def generate(self, prompt, length=128, temperature=0.8, top_k=40, state=None):
-        """Sample `length` tokens after `prompt` `(B, T)`. Greedy at temperature 0."""
+    def generate(self, prompt, length=128, temperature=0.8, top_k=40, state=None,
+                 wait=None):
+        """Sample `length` tokens after `prompt` `(B, T)`. Greedy at temperature 0.
+
+        `wait` applies per generated token exactly as in training, so decode
+        spends the same computation per token that the scored distribution was
+        produced with. Nothing about the wait steps reaches the output: the
+        count of returned tokens is `length` whatever `wait` is.
+        """
         was_training = self.training
         self.eval()
-        logits, h = self.forward(prompt, state=state, return_states=False)
+        logits, h = self.forward(prompt, state=state, return_states=False, wait=wait)
         out = []
         nxt = prompt[:, -1:]
         for _ in range(length):
@@ -411,7 +464,7 @@ class AlephCore(nn.Module):
                     step = step.masked_fill(step < kth, float('-inf'))
                 nxt = torch.multinomial(step.softmax(-1), 1)
             out.append(nxt)
-            logits, h = self.forward(nxt, state=h, return_states=False)
+            logits, h = self.forward(nxt, state=h, return_states=False, wait=wait)
         if was_training:
             self.train()
         return torch.cat(out, dim=1)
@@ -446,6 +499,6 @@ class AlephCore(nn.Module):
     def extra_repr(self):
         r = self.param_report()
         return (f"neurons={self.n}, depth={self.depth}, rank={self.rank}, "
-                f"params={r['total']:,} "
+                f"wait={self.wait}, params={r['total']:,} "
                 f"(core {r['core']:,} + refine {r['refine']:,} + "
                 f"interface {r['interface']:,} + mod {r['modulation']:,})")

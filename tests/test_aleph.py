@@ -765,6 +765,94 @@ class TestColdStart:
         assert m.attn._pos == 32
 
 
+class TestWaitSteps:
+    """Extra core steps between tokens, with no readout.
+
+    Depth here is time, so "think longer on this token" is literally more
+    applications of `W` with no token arriving. Three things have to hold or
+    the mechanism is not what it claims: `wait=0` must be bit-identical to a
+    model built without it (so it is a clean ablation axis), the wait code must
+    be outside the readout's span (a token the softmax can emit is a token the
+    softmax is trained to suppress, since every supervised position pushes
+    every non-target logit down), and one token must still produce exactly one
+    logit row so the branch horizons stay measured in tokens.
+    """
+
+    def test_wait_zero_is_bit_identical(self):
+        a, b = make(depth=4, wait=0), make(depth=4)
+        ids = torch.randint(0, V, (3, 12))
+        with torch.no_grad():
+            la, _ = a(ids)
+            lb, _ = b(ids, wait=0)
+        assert torch.equal(la, lb)
+
+    def test_one_token_one_logit_row_whatever_wait(self):
+        m = make(depth=4, wait=3)
+        ids = torch.randint(0, V, (2, 7))
+        with torch.no_grad():
+            logits, h = m(ids)
+        assert logits.shape == (2, 7, V)
+        assert h.shape == (2, m.n)
+
+    def test_wait_code_is_frozen_and_outside_the_readout(self):
+        m = make(depth=4, wait=2)
+        cb = m.codebook
+        assert 'wait_code' in dict(cb.named_buffers())
+        assert cb.wait_code.shape == (cb.width,)
+        # Not a row of H: the readout is `h @ H.t()`, so a code absent from H
+        # cannot be emitted, and therefore cannot be suppressed either.
+        assert not (cb.H == cb.wait_code).all(dim=1).any()
+
+    def test_wait_changes_the_computation(self):
+        m2 = make(depth=4, wait=2)
+        m0 = make(depth=4, wait=0)
+        m0.load_state_dict(m2.state_dict())
+        ids = torch.randint(0, V, (2, 8))
+        with torch.no_grad():
+            l2, _ = m2(ids)
+            l0, _ = m0(ids)
+        assert not torch.allclose(l2, l0)
+
+    def test_chunked_and_stepwise_agree_with_wait(self):
+        """The failure this guards: a wait step that reads a cache the decode
+        path does not carry would score one way in training and generate
+        another, exactly as the stateless conv padding once did."""
+        m = make(depth=4, wait=2)
+        m.eval()
+        ids = torch.randint(0, V, (2, 10))
+        with torch.no_grad():
+            whole, _ = m(ids)
+            m.reset_caches()
+            outs, st = [], None
+            for t in range(ids.shape[1]):
+                o, st = m(ids[:, t:t + 1], state=st)
+                outs.append(o)
+        stepwise = torch.cat(outs, dim=1)
+        assert torch.allclose(whole, stepwise, atol=1e-4)
+        assert torch.equal(whole.argmax(-1), stepwise.argmax(-1))
+
+    def test_gradient_reaches_w_through_wait_steps(self):
+        m = make(depth=4, wait=3)
+        ids = torch.randint(0, V, (2, 6))
+        logits, _ = m(ids)
+        logits.float().mean().backward()
+        assert m.W.grad is not None and m.W.grad.norm() > 0
+
+    def test_generate_returns_length_tokens_whatever_wait(self):
+        m = make(depth=4, wait=2)
+        prompt = torch.randint(0, V, (2, 4))
+        out = m.generate(prompt, length=5, temperature=0.0)
+        assert out.shape == (2, 5)
+        assert (out >= 0).all() and (out < V).all()
+
+    def test_negative_wait_is_rejected(self):
+        with pytest.raises(ValueError, match='wait'):
+            make(depth=4, wait=-1)
+        m = make(depth=4)
+        with pytest.raises(ValueError, match='wait'):
+            m(torch.randint(0, V, (1, 3)), wait=-2)
+
+
 class TestCachePortability:
     """A cache built or tracked on one OS must not break another.
 

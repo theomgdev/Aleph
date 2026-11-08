@@ -640,3 +640,47 @@ effect grows with training. So keys older than ~64 tokens are net noise for the
 attention branch while plasticity continues to improve out to 256 — further
 evidence that the two branches have divided the timescales between them, and
 that `attn_window` is wider than the job attention has taken on.
+
+## Thinking longer per token, as extra core steps
+
+Depth here is time, so "spend more computation on a hard token" has an obvious
+form: apply the step more than once between two tokens, with a frozen code on
+the input marking that no token arrived. The wait code lives outside `H`, so it
+is injected and never predicted — a code the readout cannot emit is one the
+softmax cannot be trained to suppress, which it otherwise would be, since every
+supervised position pushes every non-target logit down.
+
+The mechanism works. At 800 matched steps, `N=512`, depth 8, batch 256, seq 64,
+window 32, seed 0, for **zero added parameters**:
+
+| arm | params | steps | val nats | bpb | sec | vs base |
+|---|---|---|---|---|---|---|
+| `wait=0` | 1,027,169 | 800 | 4.0530 | 1.4842 | 147 | — |
+| `wait=1` | 1,027,169 | 800 | 3.9193 | 1.4353 | 210 | −0.134 |
+| `wait=2` | 1,027,169 | 800 | 3.8909 | 1.4249 | 257 | −0.162 |
+| `wait=4` | 1,027,169 | 800 | 3.9316 | 1.4398 | 425 | −0.121 |
+| `depth=24 wait=0` | 2,075,745 | 800 | 3.8131 | 1.3964 | 157 | −0.240 |
+| `wait=0` @ `wait=2` seconds | 1,027,169 | 1,395 | 3.6069 | 1.3209 | 266 | −0.446 |
+| `wait=0` @ `wait=4` seconds | 1,027,169 | 2,304 | 3.2496 | 1.1900 | 427 | −0.803 |
+
+And it loses anyway. The first four rows are the measurement the idea predicts:
+extra steps buy real loss for no parameters, and the curve turns at `wait=4`.
+The last two rows are the measurement that decides it. `wait=k` costs `k+1`
+sequential launches per token on a loop that is launch-bound, and a baseline
+given those same seconds — more steps, more data, same parameters — beats the
+waiting model by 0.284 nats at matched 266s and by 0.682 nats at matched 427s.
+The gap widens with budget, so it is not a warmup artifact.
+
+Two mechanisms explain the shape. The turn at `wait=4` is the backward pass:
+`wait=k` multiplies the effective backward length by `k+1`, so `window=32`
+becomes 160 steps at `wait=4`, and the per-step Jacobian sitting above 1 does
+what it always does — `|g|` hit 722.99 at step 200 there against 7.93 at
+`wait=1`. And `depth=24` reaching −0.240 in 157s says the useful part is extra
+nonlinear capacity per token, not elapsed recurrence: `depth` buys it inside one
+launch, where arithmetic is nearly free, while `wait` buys it in sequential
+launches, which is the one resource this loop does not have.
+
+So `wait` stays in the library as a measured axis (`--wait`, default 0, inert at
+0) and does not become a default. An adaptive halting head was not built: the
+fixed version has to win its time back before a learned controller is worth the
+parameters, and it does not.
