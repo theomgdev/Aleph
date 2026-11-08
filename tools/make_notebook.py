@@ -280,14 +280,18 @@ chance of stopping at exactly `k` is `λ_k ∏_{i<k}(1-λ_i)` and the last
 candidate absorbs whatever survives. That sums to one for *any* weights, so
 `PONDER_MAX` cannot be exceeded and needs no penalty to hold it.
 
-**It buys loss per token, not per second.** The exit is the expected state
+**It buys loss per token, and not by thinking.** The exit is the expected state
 `Σ_k p_k h_k`, which is a mixture rather than a choice — so every candidate step
-still has to run to produce the vector the readout reads. Truncating the
-low-probability tail at inference costs +0.43 nats, which says the model is
-using the tail as part of its representation, not keeping it as an unused
-backup. So `'adaptive'` is the better model at a fixed token budget and the
-worse use of a fixed hour; `MEASUREMENTS.md` carries the full table including
-the wall-clock arms where it loses."""),
+still has to run. Decoded alone the candidates get monotonically *worse* with
+depth, so what the mixture earns is an ensemble over differently-degraded views
+of the same token, not a deeper thought about it. Supervising each candidate
+separately instead makes an early exit free (−0.005 nats against +0.168), which
+confirms the mechanism and also removes the reason for it: given a real choice
+the head spends 0.04 steps and declines to think. So `'adaptive'` is a measured
+axis rather than a recommended setting, and the thing that would have to change
+is what gets injected during the pause — a code carrying information the state
+does not already have, rather than the same frozen vector `M` times.
+`MEASUREMENTS.md` carries both tables, including the arms that lost."""),
     code("""
 import torch
 free = torch.cuda.get_device_properties(0).total_memory / 2**30 if torch.cuda.is_available() else 0
@@ -316,8 +320,10 @@ CFG = dict(
 #              worse than 'adaptive' and worse than spending the seconds on
 #              more steps; kept because it is the control that says so.
 #
-# Honest summary: 'adaptive' buys loss per *token*, not per *second*. Use it to
-# study the mechanism or when data-bound; leave it off to reproduce the record.
+# Honest summary: the -0.301 is an ensemble over M+1 depths, not deliberation --
+# decoded alone the candidates get monotonically worse, and given a per-candidate
+# readout the head spends 0.04 steps and declines. A measured axis, not a
+# recommended setting; leave it off to reproduce the record.
 THINK       = 'off'        # 'off' | 'adaptive' | 'fixed'
 PONDER_MAX  = 4            # ceiling on extra steps (adaptive); hard, by construction
 PONDER_PRIOR= 0.5          # halting rate priced by the KL: ~1/p - 1 mean steps

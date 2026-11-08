@@ -95,10 +95,15 @@ state leaves as the norm-rescaled expectation `Σ_k p_k h_k`, which is what make
 the head trainable by the same backward pass as `W`, with no straight-through
 estimator anywhere. A KL toward a truncated geometric prices the budget.
 
-Both default to 0 and are bit-identical there. `ponder_max` is the better model
-per token (−0.301 nats at 800 matched steps) and the worse use of a second,
-because a mixture over candidates has to compute all of them — the honest
-accounting is in [`MEASUREMENTS.md`](MEASUREMENTS.md).
+Both default to 0 and are bit-identical there. `ponder_max` is worth −0.301
+nats at 800 matched steps, and the diagnosis says what it actually bought: not
+deliberation but an **ensemble** over `M+1` sequential depths. Candidates get
+monotonically *worse* with depth when decoded alone (`h_0` 6.03 → `h_4` 7.08),
+so applying `W` to a constant code walks a state away from a prediction rather
+than refining one — and the gain needs every member, which is why it cannot be
+made cheap. Given a per-candidate readout, and therefore a real choice, the head
+priced the steps at 0.04 and declined. Both tables, including the memory cost
+of the alternative, are in [`MEASUREMENTS.md`](MEASUREMENTS.md).
 
 ## What the measurements decided
 
@@ -160,14 +165,16 @@ int4 and +0.477 at ternary. That last figure independently reproduces the
 published +0.50 for sub-200M models, so it is recorded as a negative result:
 this architecture at this scale does not support 1.58-bit weights.
 
-**Extra steps per token buy loss, and lose the clock.** Applying `W` more than
+**Extra steps per token buy loss, and not by thinking.** Applying `W` more than
 once per token is worth −0.162 nats fixed and −0.301 nats with a learned
 allocation, at matched optimizer steps and almost no parameters. Given the same
-*seconds* instead, plain training wins by 0.284–0.682 nats, and the gap widens
-with budget. The learned head is genuinely state-dependent — it beats a
-constant at the same mean cost — but what it learned is a depth *ensemble*
-rather than a stopping rule: truncating the low-probability tail at inference
-costs +0.43 nats, so every candidate step has to run. Both axes ship inert.
+*seconds* instead, plain training wins by 0.284–0.682 nats. And the gain is not
+deliberation: decoded alone the candidates get monotonically worse with depth,
+so the mixture is an ensemble over differently-degraded views, which needs every
+member computed. Supervising each candidate separately makes an early exit free
+(−0.005 nats) and the head then chooses 0.04 steps — given an honest choice, it
+declines. What would have to change is the code injected during the pause, not
+the halting law. Both axes ship inert.
 
 Full tables, including the arms that lost, are in
 [`MEASUREMENTS.md`](MEASUREMENTS.md).

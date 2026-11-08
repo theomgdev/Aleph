@@ -730,6 +730,51 @@ Then the diagnostic asks what the head actually learned (`tmp/probe_ponder_why.p
 
 So differentiable halting by state expectation does not buy "stop early on easy
 tokens" — it buys a learned convex combination of $M{+}1$ sequential depths,
-which must all be run to produce the vector the readout was trained to read. Both
-`--wait` and `--ponder-max` remain in the library as inert axes (default 0,
-bit-identical at 0), and the main model stays at one step per token.
+which must all be run to produce the vector the readout was trained to read.
+
+### Mixing the loss instead of the state
+
+That conclusion is a property of mixing *states*, and the choice was made on a
+memory argument rather than a measured one, so it had to be checked. PonderNet
+mixes losses: $\mathcal{L} = \sum_k p_k \,\text{CE}(y, \text{readout}(h_k))$,
+which supervises every candidate on its own, so halting at $k$ and decoding
+from $h_k$ is exactly what training rehearsed. Both rules, one seed, one axis
+changed ($N{=}256$, depth 4, $M{=}4$, $B{=}128, T{=}64$, 600 steps,
+`tmp/probe_lossmix.py`), scoring each candidate's own readout:
+
+| | mixture CE | $h_0$ alone | $h_1$ | $h_2$ | $h_3$ | $h_4$ | mean steps |
+|---|---|---|---|---|---|---|---|
+| state-mixing | 6.0019 | 6.1699 (**+0.168**) | 6.5632 | 7.1007 | 7.1825 | 7.4375 | 0.69 |
+| loss-mixing | 6.0321 | 6.0273 (**−0.005**) | 6.5991 | 6.9352 | 7.0218 | 7.0761 | 0.04 |
+
+Loss-mixing does make the early exit free — $h_0$ decodes as well alone as the
+mixture does, against +0.168 nats under state-mixing, which is the same defect
+the $\epsilon$-truncation test found at $N{=}512$. The structural prediction
+held exactly.
+
+**And it reveals that there was nothing to allocate.** Under *both* rules the
+candidates get monotonically *worse* with depth ($h_0 \to h_4$: 6.17→7.44 and
+6.03→7.08). Extra applications of $W$ on a constant code do not refine a state
+toward a better prediction — they walk it away from one. So the −0.301 nats the
+mixture earned was an **ensemble** of $M{+}1$ differently-degraded views, which
+is a real effect and an honest one, but it is not deliberation and it cannot be
+made cheap: an ensemble needs its members. Given a readout per candidate and
+therefore an honest choice, the head priced the steps at **0.04** and declined
+to think.
+
+The memory figure in the rejected argument was also measured rather than left
+as an estimate (`tmp/probe_readout_cost.py`, $B{=}256, T{=}64, V{=}4096,
+N{=}512, M{=}8$): peak allocation 5,689 MiB for loss-mixing against 1,617 MiB
+for state-mixing, 3.5× and +4.0 GiB. The cost was real. What was wrong was
+letting it settle an architectural question it only priced — the cheap side
+bought its saving with the capability the feature existed for, and the
+measurement that would have caught it is the one above.
+
+Both `--wait` and `--ponder-max` remain in the library as inert axes (default 0,
+bit-identical at 0), and the main model stays at one step per token. The
+mechanism is in the repository because the question "does more compute per
+token help here" now has a measured answer, which is better than an assumption
+in either direction: **not on a constant code, and not by stopping early.**
+What would have to change is the thing injected during the pause — a code that
+carries information the state does not already have, rather than the same
+frozen vector $M$ times.

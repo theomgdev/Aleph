@@ -38,17 +38,26 @@ Why average the state and not the loss
 PonderNet averages the *loss* over the halting distribution, which needs one
 readout per candidate. Here the readout is `V`-wide and the branches
 (attention, plasticity, the aux adapter) are applied once per token to the
-committed state, so a per-candidate readout would be `M` copies of the widest
-tensor in the graph -- 268 MB each at `B=256, T=64, V=4096` -- and would have
-to be computed before the branches it is missing. Averaging the state costs one
-extra kernel per token and leaves the readout exactly where it was.
+committed state, so a per-candidate readout would have to be computed before
+the branches it is missing, and costs 3.5x peak memory -- 5,689 MiB against
+1,617 MiB measured at `B=256, T=64, V=4096, N=512, M=8`. Averaging the state
+costs one extra kernel per token and leaves the readout where it was.
 
-The exchange is a cleaner early exit. Truncating the loop once the survival
-probability drops below `eps` discards candidates whose total weight is below
-`eps`, so the expected state is unchanged to that tolerance, and the rescaling
-at the end absorbs the missing mass by construction. The approximation is the
-mechanism rather than a train/inference mismatch: a token that wants one step
-takes one.
+What that buys is not an early exit, and the distinction is the whole finding.
+Mixing states trains the readout to read `sum_k p_k h_k`, so a single candidate
+is not something it can decode: truncating the tail costs +0.43 nats, and `h_0`
+alone costs +0.168 against its own mixture. Mixing losses makes that free
+(-0.005), which confirms the mechanism -- and reveals there was nothing to
+allocate, because under both rules the candidates get monotonically *worse*
+with depth. Applying `W` to a constant code does not refine a prediction, so
+the mixture's gain is an ensemble over differently-degraded views rather than
+deliberation, and an ensemble needs its members. Given an honest choice the
+head priced the steps at 0.04 and declined to take them.
+
+So this module is an inert, measured axis rather than a recommended setting,
+and the thing that would have to change is the code injected during the pause:
+one that carries information the state does not already have, rather than the
+same frozen vector `M` times. `MEASUREMENTS.md` has both tables.
 
 The prior is the only thing that charges for time
 -------------------------------------------------
