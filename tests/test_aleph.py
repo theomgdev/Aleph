@@ -636,6 +636,37 @@ class TestCheckpointIdentity:
         # And the round trip is a fixed point, which is what resume compares.
         assert X.arch_of(fresh, meta) == arch
 
+    def test_resume_tolerates_a_checkpoint_predating_a_field(self):
+        """Adding an inert axis must not strand an existing checkpoint.
+
+        The guard stops weights loading into a different architecture, and a
+        field the checkpoint predates is not a difference -- `restore_arch`
+        leaves it at the CLI default, which is the value it trained under.
+        Indexing `ARCH_FIELDS` directly instead raises `KeyError` and makes
+        every older checkpoint unresumable.
+        """
+        import argparse
+        import tools.experiment as X
+        a = argparse.Namespace(
+            neurons=64, depth=4, rank=None, nnz=16, code='random', seed=0,
+            no_self_gain=False, no_attn=True, attn_heads=2, attn_kv_heads=1,
+            attn_head_dim=8, attn_window=16,
+            no_plastic=False, plastic_dim=8, no_aux=True, aux_rank=4,
+            aux_kernel=3, quant='int8', wait=0, ponder_max=0,
+            ponder_prior=0.5, ponder_eps=0.01)
+        meta = {'vocab_size': V, 'path': 'x/y.bin'}
+        now = X.arch_of(a, meta)
+        # A checkpoint written before wait/ponder existed.
+        old_blob = {'arch': {k: v for k, v in now.items()
+                             if not (k == 'wait' or k.startswith('ponder'))}}
+        saved = {k: old_blob['arch'][k] for k in X.ARCH_FIELDS
+                 if k in old_blob['arch']}
+        assert saved == {k: now[k] for k in saved}
+        # A genuine mismatch still trips it.
+        a.depth = 8
+        changed = X.arch_of(a, meta)
+        assert saved != {k: changed[k] for k in saved}
+
     def test_state_dict_reloads_strictly_for_every_branch_combination(self):
         import itertools
         for attn, plastic, aux in itertools.product((True, False), repeat=3):

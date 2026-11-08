@@ -156,9 +156,15 @@ def run_train(a, meta):
         # weights_only=True: the payload is tensors, dicts and scalars only, so
         # nothing here needs arbitrary unpickling.
         blob = torch.load(ck, map_location=a.device, weights_only=True)
-        saved = {k: blob['arch'][k] for k in ARCH_FIELDS}
-        if saved != arch_of(a, meta):
-            raise SystemExit(f"checkpoint architecture differs:\n  saved {saved}\n  now   {arch_of(a, meta)}")
+        # A checkpoint written before a field existed does not carry it, and
+        # `restore_arch` leaves those at the CLI default. Compare only what the
+        # checkpoint actually claims, or adding an inert axis would make every
+        # older checkpoint unresumable.
+        now = arch_of(a, meta)
+        saved = {k: blob['arch'][k] for k in ARCH_FIELDS if k in blob['arch']}
+        if saved != {k: now[k] for k in saved}:
+            differing = {k: (v, now[k]) for k, v in saved.items() if v != now[k]}
+            raise SystemExit(f"checkpoint architecture differs (saved, now): {differing}")
         model.load_state_dict(blob['model'])
         trainer.opt.load_state_dict(blob['opt'])
         trainer.step_count = start = blob['step']
